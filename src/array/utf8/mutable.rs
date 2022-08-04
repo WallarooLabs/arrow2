@@ -3,7 +3,7 @@ use std::{iter::FromIterator, sync::Arc};
 use crate::{
     array::{
         specification::{check_offsets_minimal, try_check_offsets_and_utf8},
-        Array, MutableArray, Offset, TryExtend, TryPush,
+        Array, MutableArray, Offset, Preallocate, TryExtend, TryPush,
     },
     bitmap::MutableBitmap,
     datatypes::DataType,
@@ -252,6 +252,12 @@ impl<O: Offset> MutableUtf8Array<O> {
     /// returns its offsets.
     pub fn offsets(&self) -> &Vec<O> {
         &self.offsets
+    }
+}
+
+impl<O: Offset> Preallocate for MutableUtf8Array<O> {
+    fn with_capacity(capacity: usize) -> Self {
+        MutableUtf8Array::with_capacity(capacity)
     }
 }
 
