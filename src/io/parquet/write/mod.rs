@@ -1,4 +1,17 @@
 //! APIs to write to Parquet format.
+//!
+//! # Arrow/Parquet Interoperability
+//! As of [parquet-format v2.9](https://github.com/apache/parquet-format/blob/master/LogicalTypes.md)
+//! there are Arrow [DataTypes](crate::datatypes::DataType) which do not have a parquet
+//! representation. These include but are not limited to:
+//! * `DataType::Timestamp(TimeUnit::Second, _)`
+//! * `DataType::Int64`
+//! * `DataType::Duration`
+//! * `DataType::Date64`
+//! * `DataType::Time32(TimeUnit::Second)`
+//!
+//! The use of these arrow types will result in no logical type being stored within a parquet file.
+
 mod binary;
 mod boolean;
 mod dictionary;
@@ -21,7 +34,7 @@ use crate::types::NativeType;
 
 use parquet2::schema::types::PrimitiveType as ParquetPrimitiveType;
 pub use parquet2::{
-    compression::{BrotliLevel, CompressionLevel, CompressionOptions, GzipLevel, ZstdLevel},
+    compression::{BrotliLevel, CompressionOptions, GzipLevel, ZstdLevel},
     encoding::Encoding,
     fallible_streaming_iterator,
     metadata::{Descriptor, FileMetaData, KeyValue, SchemaDescriptor, ThriftFileMetaData},
@@ -79,8 +92,14 @@ pub fn to_parquet_schema(schema: &Schema) -> Result<SchemaDescriptor> {
 /// Note that this is whether this implementation supports it, which is a subset of
 /// what the parquet spec allows.
 pub fn can_encode(data_type: &DataType, encoding: Encoding) -> bool {
+    if let (Encoding::DeltaBinaryPacked, DataType::Decimal(p, _)) =
+        (encoding, data_type.to_logical_type())
+    {
+        return *p <= 18;
+    };
+
     matches!(
-        (encoding, data_type),
+        (encoding, data_type.to_logical_type()),
         (Encoding::Plain, _)
             | (
                 Encoding::DeltaLengthByteArray,
@@ -88,6 +107,24 @@ pub fn can_encode(data_type: &DataType, encoding: Encoding) -> bool {
             )
             | (Encoding::RleDictionary, DataType::Dictionary(_, _, _))
             | (Encoding::PlainDictionary, DataType::Dictionary(_, _, _))
+            | (
+                Encoding::DeltaBinaryPacked,
+                DataType::Null
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Date32
+                    | DataType::Time32(_)
+                    | DataType::Int64
+                    | DataType::Date64
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+                    | DataType::Duration(_)
+            )
     )
 }
 
@@ -95,7 +132,7 @@ pub fn can_encode(data_type: &DataType, encoding: Encoding) -> bool {
 pub fn array_to_pages(
     array: &dyn Array,
     type_: ParquetPrimitiveType,
-    nested: Vec<Nested>,
+    nested: &[Nested],
     options: WriteOptions,
     encoding: Encoding,
 ) -> Result<DynIter<'static, Result<EncodedPage>>> {
@@ -110,7 +147,7 @@ pub fn array_to_pages(
         let right = array.slice(split_at, array.len() - split_at);
 
         Ok(DynIter::new(
-            array_to_pages(&*left, type_.clone(), nested.clone(), options, encoding)?
+            array_to_pages(&*left, type_.clone(), nested, options, encoding)?
                 .chain(array_to_pages(&*right, type_, nested, options, encoding)?),
         ))
     } else {
@@ -120,6 +157,7 @@ pub fn array_to_pages(
                     dictionary::array_to_pages::<$T>(
                         array.as_any().downcast_ref().unwrap(),
                         type_,
+                        nested,
                         options,
                         encoding,
                     )
@@ -135,7 +173,7 @@ pub fn array_to_pages(
 pub fn array_to_page(
     array: &dyn Array,
     type_: ParquetPrimitiveType,
-    nested: Vec<Nested>,
+    nested: &[Nested],
     options: WriteOptions,
     encoding: Encoding,
 ) -> Result<EncodedPage> {
@@ -166,58 +204,66 @@ pub fn array_to_page_simple(
             boolean::array_to_page(array.as_any().downcast_ref().unwrap(), options, type_)
         }
         // casts below MUST match the casts done at the metadata (field -> parquet type).
-        DataType::UInt8 => primitive::array_to_page::<u8, i32>(
+        DataType::UInt8 => primitive::array_to_page_integer::<u8, i32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
-        DataType::UInt16 => primitive::array_to_page::<u16, i32>(
+        DataType::UInt16 => primitive::array_to_page_integer::<u16, i32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
-        DataType::UInt32 => primitive::array_to_page::<u32, i32>(
+        DataType::UInt32 => primitive::array_to_page_integer::<u32, i32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
-        DataType::UInt64 => primitive::array_to_page::<u64, i64>(
+        DataType::UInt64 => primitive::array_to_page_integer::<u64, i64>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
-        DataType::Int8 => primitive::array_to_page::<i8, i32>(
+        DataType::Int8 => primitive::array_to_page_integer::<i8, i32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
-        DataType::Int16 => primitive::array_to_page::<i16, i32>(
+        DataType::Int16 => primitive::array_to_page_integer::<i16, i32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
+            encoding,
         ),
         DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
-            primitive::array_to_page::<i32, i32>(
+            primitive::array_to_page_integer::<i32, i32>(
                 array.as_any().downcast_ref().unwrap(),
                 options,
                 type_,
+                encoding,
             )
         }
         DataType::Int64
         | DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
-        | DataType::Duration(_) => primitive::array_to_page::<i64, i64>(
+        | DataType::Duration(_) => primitive::array_to_page_integer::<i64, i64>(
+            array.as_any().downcast_ref().unwrap(),
+            options,
+            type_,
+            encoding,
+        ),
+        DataType::Float32 => primitive::array_to_page_plain::<f32, f32>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
         ),
-        DataType::Float32 => primitive::array_to_page::<f32, f32>(
-            array.as_any().downcast_ref().unwrap(),
-            options,
-            type_,
-        ),
-        DataType::Float64 => primitive::array_to_page::<f64, f64>(
+        DataType::Float64 => primitive::array_to_page_plain::<f64, f64>(
             array.as_any().downcast_ref().unwrap(),
             options,
             type_,
@@ -248,7 +294,7 @@ pub fn array_to_page_simple(
         ),
         DataType::Null => {
             let array = Int32Array::new_null(DataType::Int32, array.len());
-            primitive::array_to_page::<i32, i32>(&array, options, type_)
+            primitive::array_to_page_plain::<i32, i32>(&array, options, type_)
         }
         DataType::Interval(IntervalUnit::YearMonth) => {
             let type_ = type_;
@@ -326,7 +372,7 @@ pub fn array_to_page_simple(
 
                 let array =
                     PrimitiveArray::<i32>::new(DataType::Int32, values, array.validity().cloned());
-                primitive::array_to_page::<i32, i32>(&array, options, type_)
+                primitive::array_to_page_integer::<i32, i32>(&array, options, type_, encoding)
             } else if precision <= 18 {
                 let values = array
                     .values()
@@ -337,7 +383,7 @@ pub fn array_to_page_simple(
 
                 let array =
                     PrimitiveArray::<i64>::new(DataType::Int64, values, array.validity().cloned());
-                primitive::array_to_page::<i64, i64>(&array, options, type_)
+                primitive::array_to_page_integer::<i64, i64>(&array, options, type_, encoding)
             } else {
                 let size = decimal_length_from_precision(precision);
 
@@ -373,7 +419,7 @@ pub fn array_to_page_simple(
 fn array_to_page_nested(
     array: &dyn Array,
     type_: ParquetPrimitiveType,
-    nested: Vec<Nested>,
+    nested: &[Nested],
     options: WriteOptions,
     _encoding: Encoding,
 ) -> Result<EncodedPage> {

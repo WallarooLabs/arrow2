@@ -57,7 +57,7 @@ mod simd;
 pub use simd::{Simd8, Simd8Lanes, Simd8PartialEq, Simd8PartialOrd};
 
 use super::take::take_boolean;
-use crate::bitmap::Bitmap;
+use crate::bitmap::{binary, Bitmap};
 use crate::compute;
 pub(crate) use primitive::{
     compare_values_op as primitive_compare_values_op,
@@ -69,12 +69,14 @@ macro_rules! match_eq_ord {(
 ) => ({
     macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
     use crate::datatypes::PrimitiveType::*;
+    use crate::types::i256;
     match $key_type {
         Int8 => __with_ty__! { i8 },
         Int16 => __with_ty__! { i16 },
         Int32 => __with_ty__! { i32 },
         Int64 => __with_ty__! { i64 },
         Int128 => __with_ty__! { i128 },
+        Int256 => __with_ty__! { i256 },
         DaysMs => todo!(),
         MonthDayNano => todo!(),
         UInt8 => __with_ty__! { u8 },
@@ -92,13 +94,14 @@ macro_rules! match_eq {(
 ) => ({
     macro_rules! __with_ty__ {( $_ $T:ident ) => ( $($body)* )}
     use crate::datatypes::PrimitiveType::*;
-    use crate::types::{days_ms, months_days_ns, f16};
+    use crate::types::{days_ms, months_days_ns, f16, i256};
     match $key_type {
         Int8 => __with_ty__! { i8 },
         Int16 => __with_ty__! { i16 },
         Int32 => __with_ty__! { i32 },
         Int64 => __with_ty__! { i64 },
         Int128 => __with_ty__! { i128 },
+        Int256 => __with_ty__! { i256 },
         DaysMs => __with_ty__! { days_ms },
         MonthDayNano => __with_ty__! { months_days_ns },
         UInt8 => __with_ty__! { u8 },
@@ -521,10 +524,43 @@ fn finish_eq_validities(
             &BooleanArray::new(DataType::Boolean, rhs, None),
         ),
         (Some(lhs), Some(rhs)) => {
+            let lhs_validity_unset_bits = lhs.unset_bits();
+            let rhs_validity_unset_bits = rhs.unset_bits();
+
+            // this branch is a bit more complicated as both arrays can have masked out values
+            // these masked out values might differ and lead to a `eq == false` that has to
+            // be corrected as both should be `null == null = true`
+
             let lhs = BooleanArray::new(DataType::Boolean, lhs, None);
             let rhs = BooleanArray::new(DataType::Boolean, rhs, None);
             let eq_validities = compute::comparison::boolean::eq(&lhs, &rhs);
-            compute::boolean::and(&output_without_validities, &eq_validities)
+
+            // validity_bits are equal AND values are equal
+            let equal = compute::boolean::and(&output_without_validities, &eq_validities);
+
+            match (lhs_validity_unset_bits, rhs_validity_unset_bits) {
+                // there is at least one side with all values valid
+                // so we don't have to correct.
+                (0, _) | (_, 0) => equal,
+                _ => {
+                    // we use the binary kernel here to save allocations
+                    // and apply `!(lhs | rhs)` in one step
+                    let both_sides_invalid =
+                        compute::boolean::binary_boolean_kernel(&lhs, &rhs, |lhs, rhs| {
+                            binary(lhs, rhs, |lhs, rhs| !(lhs | rhs))
+                        });
+                    // this still might include incorrect masked out values
+                    // under the validity bits, so we must correct for that
+
+                    // if not all true, e.g. at least one is set.
+                    // then we propagate that null as `true` in equality
+                    if both_sides_invalid.values().unset_bits() != both_sides_invalid.len() {
+                        compute::boolean::or(&equal, &both_sides_invalid)
+                    } else {
+                        equal
+                    }
+                }
+            }
         }
     }
 }
@@ -547,10 +583,49 @@ fn finish_neq_validities(
             compute::boolean::or(&output_without_validities, &rhs_negated)
         }
         (Some(lhs), Some(rhs)) => {
+            let lhs_validity_unset_bits = lhs.unset_bits();
+            let rhs_validity_unset_bits = rhs.unset_bits();
+
+            // this branch is a bit more complicated as both arrays can have masked out values
+            // these masked out values might differ and lead to a `neq == true` that has to
+            // be corrected as both should be `null != null = false`
             let lhs = BooleanArray::new(DataType::Boolean, lhs, None);
             let rhs = BooleanArray::new(DataType::Boolean, rhs, None);
             let neq_validities = compute::comparison::boolean::neq(&lhs, &rhs);
-            compute::boolean::or(&output_without_validities, &neq_validities)
+
+            // validity_bits are not equal OR values not equal
+            let or = compute::boolean::or(&output_without_validities, &neq_validities);
+
+            match (lhs_validity_unset_bits, rhs_validity_unset_bits) {
+                // there is at least one side with all values valid
+                // so we don't have to correct.
+                (0, _) | (_, 0) => or,
+                _ => {
+                    // we use the binary kernel here to save allocations
+                    // and apply `!(lhs | rhs)` in one step
+                    let both_sides_invalid =
+                        compute::boolean::binary_boolean_kernel(&lhs, &rhs, |lhs, rhs| {
+                            binary(lhs, rhs, |lhs, rhs| !(lhs | rhs))
+                        });
+                    // this still might include incorrect masked out values
+                    // under the validity bits, so we must correct for that
+
+                    // if not all true, e.g. at least one is set.
+                    // then we propagate that null as `false` as the nulls are equal
+                    if both_sides_invalid.values().unset_bits() != both_sides_invalid.len() {
+                        // we use the `binary` kernel directly to save allocations
+                        // and apply `lhs & !rhs)` in one shot.
+
+                        compute::boolean::binary_boolean_kernel(
+                            &or,
+                            &both_sides_invalid,
+                            |lhs, rhs| binary(lhs, rhs, |lhs, rhs| (lhs & !rhs)),
+                        )
+                    } else {
+                        or
+                    }
+                }
+            }
         }
     }
 }

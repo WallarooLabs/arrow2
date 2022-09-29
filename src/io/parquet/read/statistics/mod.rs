@@ -10,6 +10,7 @@ use parquet2::statistics::{
     BinaryStatistics, BooleanStatistics, FixedLenStatistics, PrimitiveStatistics,
     Statistics as ParquetStatistics,
 };
+use parquet2::types::int96_to_i64_ns;
 
 use crate::array::*;
 use crate::datatypes::IntervalUnit;
@@ -31,28 +32,13 @@ use self::list::DynMutableListArray;
 
 use super::get_field_columns;
 
-/// Enum of a count statistics
-#[derive(Debug, PartialEq)]
-pub enum Count {
-    /// simple arrays have a count of UInt64
-    Single(UInt64Array),
-    /// list arrays have a count as a list of UInt64
-    List(ListArray<i32>),
-    /// list arrays have a count as a list of UInt64
-    LargeList(ListArray<i64>),
-    /// struct arrays have a count as a struct of UInt64
-    Struct(StructArray),
-    /// map arrays have a count as a map of UInt64
-    Map(MapArray),
-}
-
 /// Arrow-deserialized parquet Statistics of a file
 #[derive(Debug, PartialEq)]
 pub struct Statistics {
-    /// number of nulls.
-    pub null_count: Count,
-    /// number of dictinct values
-    pub distinct_count: Count,
+    /// number of nulls. This is a [`UInt64Array`] for non-nested types
+    pub null_count: Box<dyn Array>,
+    /// number of dictinct values. This is a [`UInt64Array`] for non-nested types
+    pub distinct_count: Box<dyn Array>,
     /// Minimum
     pub min_value: Box<dyn Array>,
     /// Maximum
@@ -75,98 +61,88 @@ struct MutableStatistics {
 impl From<MutableStatistics> for Statistics {
     fn from(mut s: MutableStatistics) -> Self {
         let null_count = if let PhysicalType::Struct = s.null_count.data_type().to_physical_type() {
-            let a = s
-                .null_count
+            s.null_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .unwrap()
-                .clone();
-            Count::Struct(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::Map = s.null_count.data_type().to_physical_type() {
-            let a = s
-                .null_count
+            s.null_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<MapArray>()
                 .unwrap()
-                .clone();
-            Count::Map(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::List = s.null_count.data_type().to_physical_type() {
-            let a = s
-                .null_count
+            s.null_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<ListArray<i32>>()
                 .unwrap()
-                .clone();
-            Count::List(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::LargeList = s.null_count.data_type().to_physical_type() {
-            let a = s
-                .null_count
+            s.null_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<ListArray<i64>>()
                 .unwrap()
-                .clone();
-            Count::LargeList(a)
+                .clone()
+                .boxed()
         } else {
-            let a = s
-                .null_count
+            s.null_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
-                .clone();
-            Count::Single(a)
+                .clone()
+                .boxed()
         };
         let distinct_count = if let PhysicalType::Struct =
             s.distinct_count.data_type().to_physical_type()
         {
-            let a = s
-                .distinct_count
+            s.distinct_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .unwrap()
-                .clone();
-            Count::Struct(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::Map = s.distinct_count.data_type().to_physical_type() {
-            let a = s
-                .distinct_count
+            s.distinct_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<MapArray>()
                 .unwrap()
-                .clone();
-            Count::Map(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::List = s.distinct_count.data_type().to_physical_type() {
-            let a = s
-                .distinct_count
+            s.distinct_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<ListArray<i32>>()
                 .unwrap()
-                .clone();
-            Count::List(a)
+                .clone()
+                .boxed()
         } else if let PhysicalType::LargeList = s.distinct_count.data_type().to_physical_type() {
-            let a = s
-                .distinct_count
+            s.distinct_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<ListArray<i64>>()
                 .unwrap()
-                .clone();
-            Count::LargeList(a)
+                .clone()
+                .boxed()
         } else {
-            let a = s
-                .distinct_count
+            s.distinct_count
                 .as_box()
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
-                .clone();
-            Count::Single(a)
+                .clone()
+                .boxed()
         };
         Self {
             null_count,
@@ -487,13 +463,41 @@ fn push(
         UInt64 => primitive::push(from, min, max, |x: i64| Ok(x as u64)),
         Timestamp(time_unit, _) => {
             let time_unit = *time_unit;
-            primitive::push(from, min, max, |x: i64| {
-                Ok(primitive::timestamp(
-                    type_.logical_type.as_ref(),
-                    time_unit,
-                    x,
-                ))
-            })
+            if physical_type == &ParquetPhysicalType::Int96 {
+                let from = from.map(|from| {
+                    let from = from
+                        .as_any()
+                        .downcast_ref::<PrimitiveStatistics<[u32; 3]>>()
+                        .unwrap();
+                    PrimitiveStatistics::<i64> {
+                        primitive_type: from.primitive_type.clone(),
+                        null_count: from.null_count,
+                        distinct_count: from.distinct_count,
+                        min_value: from.min_value.map(int96_to_i64_ns),
+                        max_value: from.max_value.map(int96_to_i64_ns),
+                    }
+                });
+                primitive::push(
+                    from.as_ref().map(|x| x as &dyn ParquetStatistics),
+                    min,
+                    max,
+                    |x: i64| {
+                        Ok(primitive::timestamp(
+                            type_.logical_type.as_ref(),
+                            time_unit,
+                            x,
+                        ))
+                    },
+                )
+            } else {
+                primitive::push(from, min, max, |x: i64| {
+                    Ok(primitive::timestamp(
+                        type_.logical_type.as_ref(),
+                        time_unit,
+                        x,
+                    ))
+                })
+            }
         }
         Float32 => primitive::push(from, min, max, |x: f32| Ok(x as f32)),
         Float64 => primitive::push(from, min, max, |x: f64| Ok(x as f64)),

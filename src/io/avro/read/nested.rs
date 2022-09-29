@@ -112,6 +112,10 @@ impl<O: Offset> MutableArray for DynMutableListArray<O> {
         self.push_null()
     }
 
+    fn reserve(&mut self, _: usize) {
+        todo!();
+    }
+
     fn shrink_to_fit(&mut self) {
         todo!();
     }
@@ -195,6 +199,10 @@ impl MutableArray for FixedItemsUtf8Dictionary {
         self.push_null()
     }
 
+    fn reserve(&mut self, _: usize) {
+        todo!();
+    }
+
     fn shrink_to_fit(&mut self) {
         todo!();
     }
@@ -220,6 +228,14 @@ impl DynMutableStructArray {
     /// The values
     pub fn mut_values(&mut self, field: usize) -> &mut dyn MutableArray {
         self.values[field].as_mut()
+    }
+
+    #[inline]
+    pub fn try_push_valid(&mut self) -> Result<()> {
+        if let Some(validity) = &mut self.validity {
+            validity.push(true)
+        }
+        Ok(())
     }
 
     #[inline]
@@ -285,6 +301,10 @@ impl MutableArray for DynMutableStructArray {
     #[inline]
     fn push_null(&mut self) {
         self.push_null()
+    }
+
+    fn reserve(&mut self, _: usize) {
+        todo!();
     }
 
     fn shrink_to_fit(&mut self) {

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use parquet2::{
     encoding::Encoding,
-    page::{split_buffer, DataPage},
+    page::{split_buffer, DataPage, DictPage},
     schema::Repetition,
 };
 
@@ -16,7 +16,7 @@ use crate::{
 use super::super::nested_utils::*;
 use super::super::utils;
 use super::super::utils::MaybeNext;
-use super::super::DataPages;
+use super::super::Pages;
 
 // The state of a `DataPage` of `Boolean` parquet boolean type
 #[allow(clippy::large_enum_variant)]
@@ -46,9 +46,14 @@ struct BooleanDecoder {}
 
 impl<'a> NestedDecoder<'a> for BooleanDecoder {
     type State = State<'a>;
+    type Dictionary = ();
     type DecodedState = (MutableBitmap, MutableBitmap);
 
-    fn build_state(&self, page: &'a DataPage) -> Result<Self::State> {
+    fn build_state(
+        &self,
+        page: &'a DataPage,
+        _: Option<&'a Self::Dictionary>,
+    ) -> Result<Self::State> {
         let is_optional =
             page.descriptor.primitive_type.field_info.repetition == Repetition::Optional;
         let is_filtered = page.selected_rows().is_some();
@@ -77,7 +82,7 @@ impl<'a> NestedDecoder<'a> for BooleanDecoder {
         )
     }
 
-    fn push_valid(&self, state: &mut State, decoded: &mut Self::DecodedState) {
+    fn push_valid(&self, state: &mut State, decoded: &mut Self::DecodedState) -> Result<()> {
         let (values, validity) = decoded;
         match state {
             State::Optional(page_values) => {
@@ -90,6 +95,7 @@ impl<'a> NestedDecoder<'a> for BooleanDecoder {
                 values.push(value);
             }
         }
+        Ok(())
     }
 
     fn push_null(&self, decoded: &mut Self::DecodedState) {
@@ -97,23 +103,27 @@ impl<'a> NestedDecoder<'a> for BooleanDecoder {
         values.push(false);
         validity.push(false);
     }
+
+    fn deserialize_dict(&self, _: &DictPage) -> Self::Dictionary {}
 }
 
-/// An iterator adapter over [`DataPages`] assumed to be encoded as boolean arrays
+/// An iterator adapter over [`Pages`] assumed to be encoded as boolean arrays
 #[derive(Debug)]
-pub struct ArrayIterator<I: DataPages> {
+pub struct NestedIter<I: Pages> {
     iter: I,
     init: Vec<InitNested>,
     items: VecDeque<(NestedState, (MutableBitmap, MutableBitmap))>,
+    remaining: usize,
     chunk_size: Option<usize>,
 }
 
-impl<I: DataPages> ArrayIterator<I> {
-    pub fn new(iter: I, init: Vec<InitNested>, chunk_size: Option<usize>) -> Self {
+impl<I: Pages> NestedIter<I> {
+    pub fn new(iter: I, init: Vec<InitNested>, num_rows: usize, chunk_size: Option<usize>) -> Self {
         Self {
             iter,
             init,
             items: VecDeque::new(),
+            remaining: num_rows,
             chunk_size,
         }
     }
@@ -123,13 +133,15 @@ fn finish(data_type: &DataType, values: MutableBitmap, validity: MutableBitmap) 
     BooleanArray::new(data_type.clone(), values.into(), validity.into())
 }
 
-impl<I: DataPages> Iterator for ArrayIterator<I> {
+impl<I: Pages> Iterator for NestedIter<I> {
     type Item = Result<(NestedState, BooleanArray)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let maybe_state = next(
             &mut self.iter,
             &mut self.items,
+            &mut None,
+            &mut self.remaining,
             &self.init,
             self.chunk_size,
             &BooleanDecoder::default(),

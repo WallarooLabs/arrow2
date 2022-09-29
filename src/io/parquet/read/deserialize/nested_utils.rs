@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use parquet2::{
     encoding::hybrid_rle::HybridRleDecoder,
-    page::{split_buffer, DataPage},
+    page::{split_buffer, DataPage, DictPage, Page},
     read::levels::get_bit_width,
 };
 
@@ -10,7 +10,7 @@ use crate::{array::Array, bitmap::MutableBitmap, error::Result};
 
 pub use super::utils::Zip;
 use super::utils::{DecodedState, MaybeNext};
-use super::{super::DataPages, utils::PageState};
+use super::{super::Pages, utils::PageState};
 
 /// trait describing deserialized repetition and definition levels
 pub trait Nested: std::fmt::Debug + Send + Sync {
@@ -246,15 +246,22 @@ impl Nested for NestedStruct {
 /// A decoder that knows how to map `State` -> Array
 pub(super) trait NestedDecoder<'a> {
     type State: PageState<'a>;
-    type DecodedState: DecodedState<'a>;
+    type Dictionary;
+    type DecodedState: DecodedState;
 
-    fn build_state(&self, page: &'a DataPage) -> Result<Self::State>;
+    fn build_state(
+        &self,
+        page: &'a DataPage,
+        dict: Option<&'a Self::Dictionary>,
+    ) -> Result<Self::State>;
 
     /// Initializes a new state
     fn with_capacity(&self, capacity: usize) -> Self::DecodedState;
 
-    fn push_valid(&self, state: &mut Self::State, decoded: &mut Self::DecodedState);
+    fn push_valid(&self, state: &mut Self::State, decoded: &mut Self::DecodedState) -> Result<()>;
     fn push_null(&self, decoded: &mut Self::DecodedState);
+
+    fn deserialize_dict(&self, page: &DictPage) -> Self::Dictionary;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,9 +309,9 @@ impl<'a> NestedPage<'a> {
         let max_def_level = page.descriptor.max_def_level;
 
         let reps =
-            HybridRleDecoder::new(rep_levels, get_bit_width(max_rep_level), page.num_values());
+            HybridRleDecoder::try_new(rep_levels, get_bit_width(max_rep_level), page.num_values())?;
         let defs =
-            HybridRleDecoder::new(def_levels, get_bit_width(max_def_level), page.num_values());
+            HybridRleDecoder::try_new(def_levels, get_bit_width(max_def_level), page.num_values())?;
 
         let iter = reps.zip(defs).peekable();
 
@@ -336,32 +343,31 @@ impl NestedState {
 
 /// Extends `items` by consuming `page`, first trying to complete the last `item`
 /// and extending it if more are needed
-fn extend<'a, D: NestedDecoder<'a>>(
+pub(super) fn extend<'a, D: NestedDecoder<'a>>(
     page: &'a DataPage,
     init: &[InitNested],
     items: &mut VecDeque<(NestedState, D::DecodedState)>,
+    dict: Option<&'a D::Dictionary>,
+    remaining: &mut usize,
     decoder: &D,
     chunk_size: Option<usize>,
 ) -> Result<()> {
-    let mut values_page = decoder.build_state(page)?;
+    let mut values_page = decoder.build_state(page, dict)?;
     let mut page = NestedPage::try_new(page)?;
 
     let capacity = chunk_size.unwrap_or(0);
+    // chunk_size = None, remaining = 44 => chunk_size = 44
     let chunk_size = chunk_size.unwrap_or(usize::MAX);
 
     let (mut nested, mut decoded) = if let Some((nested, decoded)) = items.pop_back() {
-        // there is a already a state => it must be incomplete...
-        debug_assert!(
-            nested.len() < chunk_size,
-            "the temp array is expected to be incomplete"
-        );
         (nested, decoded)
     } else {
         // there is no state => initialize it
         (init_nested(init, capacity), decoder.with_capacity(0))
     };
+    let existing = nested.len();
 
-    let remaining = chunk_size - nested.len();
+    let additional = (chunk_size - existing).min(*remaining);
 
     // extend the current state
     extend_offsets2(
@@ -370,12 +376,15 @@ fn extend<'a, D: NestedDecoder<'a>>(
         &mut nested.nested,
         &mut decoded,
         decoder,
-        remaining,
-    );
+        additional,
+    )?;
+    *remaining -= nested.len() - existing;
     items.push_back((nested, decoded));
 
-    while page.len() > 0 {
-        let mut nested = init_nested(init, capacity);
+    while page.len() > 0 && *remaining > 0 {
+        let additional = chunk_size.min(*remaining);
+
+        let mut nested = init_nested(init, additional);
         let mut decoded = decoder.with_capacity(0);
         extend_offsets2(
             &mut page,
@@ -383,8 +392,9 @@ fn extend<'a, D: NestedDecoder<'a>>(
             &mut nested.nested,
             &mut decoded,
             decoder,
-            chunk_size,
-        );
+            additional,
+        )?;
+        *remaining -= nested.len();
         items.push_back((nested, decoded));
     }
     Ok(())
@@ -397,55 +407,54 @@ fn extend_offsets2<'a, D: NestedDecoder<'a>>(
     decoded: &mut D::DecodedState,
     decoder: &D,
     additional: usize,
-) {
-    let mut values_count = vec![0; nested.len()];
+) -> Result<()> {
+    let max_depth = nested.len();
 
-    for (depth, nest) in nested.iter().enumerate().skip(1) {
-        values_count[depth - 1] = nest.len() as i64
-    }
-    *values_count.last_mut().unwrap() = nested.last().unwrap().len() as i64;
-
-    let mut cum_sum = vec![0u32; nested.len() + 1];
+    let mut cum_sum = vec![0u32; max_depth + 1];
     for (i, nest) in nested.iter().enumerate() {
         let delta = nest.is_nullable() as u32 + nest.is_repeated() as u32;
         cum_sum[i + 1] = cum_sum[i] + delta;
     }
 
-    let mut cum_rep = vec![0u32; nested.len() + 1];
+    let mut cum_rep = vec![0u32; max_depth + 1];
     for (i, nest) in nested.iter().enumerate() {
         let delta = nest.is_repeated() as u32;
         cum_rep[i + 1] = cum_rep[i] + delta;
     }
 
-    let max_depth = nested.len() - 1;
-
     let mut rows = 0;
     while let Some((rep, def)) = page.iter.next() {
+        let rep = rep?;
+        let def = def?;
         if rep == 0 {
             rows += 1;
         }
 
         let mut is_required = false;
-        for (depth, nest) in nested.iter_mut().enumerate() {
+        for depth in 0..max_depth {
             let right_level = rep <= cum_rep[depth] && def >= cum_sum[depth];
             if is_required || right_level {
+                let length = nested
+                    .get(depth + 1)
+                    .map(|x| x.len() as i64)
+                    // the last depth is the leaf, which is always increased by 1
+                    .unwrap_or(1);
+
+                let nest = &mut nested[depth];
+
                 let is_valid = nest.is_nullable() && def > cum_sum[depth];
-                let length = values_count[depth];
                 nest.push(length, is_valid);
-                if depth > 0 {
-                    values_count[depth - 1] = nest.len() as i64;
-                };
                 if nest.is_required() && !is_valid {
                     is_required = true;
                 } else {
                     is_required = false
                 };
 
-                if depth == max_depth {
+                if depth == max_depth - 1 {
                     // the leaf / primitive
                     let is_valid = (def != cum_sum[depth]) || !nest.is_nullable();
                     if right_level && is_valid {
-                        decoder.push_valid(values_state, decoded);
+                        decoder.push_valid(values_state, decoded)?;
                     } else {
                         decoder.push_null(decoded);
                     }
@@ -453,53 +462,87 @@ fn extend_offsets2<'a, D: NestedDecoder<'a>>(
             }
         }
 
-        let next_rep = page.iter.peek().map(|x| x.0).unwrap_or(0);
+        let next_rep = *page
+            .iter
+            .peek()
+            .map(|x| x.0.as_ref())
+            .transpose()
+            .unwrap() // todo: fix this
+            .unwrap_or(&0);
 
-        if next_rep == 0 && rows == additional.saturating_add(1) {
+        if next_rep == 0 && rows == additional {
             break;
         }
     }
+    Ok(())
 }
 
 #[inline]
 pub(super) fn next<'a, I, D>(
     iter: &'a mut I,
     items: &mut VecDeque<(NestedState, D::DecodedState)>,
+    dict: &'a mut Option<D::Dictionary>,
+    remaining: &mut usize,
     init: &[InitNested],
     chunk_size: Option<usize>,
     decoder: &D,
 ) -> MaybeNext<Result<(NestedState, D::DecodedState)>>
 where
-    I: DataPages,
+    I: Pages,
     D: NestedDecoder<'a>,
 {
     // front[a1, a2, a3, ...]back
     if items.len() > 1 {
-        let (nested, decoded) = items.pop_front().unwrap();
-        return MaybeNext::Some(Ok((nested, decoded)));
+        return MaybeNext::Some(Ok(items.pop_front().unwrap()));
+    }
+    if (items.len() == 1) && items.front().unwrap().0.len() == chunk_size.unwrap_or(usize::MAX) {
+        return MaybeNext::Some(Ok(items.pop_front().unwrap()));
+    }
+    if *remaining == 0 {
+        return match items.pop_front() {
+            Some(decoded) => MaybeNext::Some(Ok(decoded)),
+            None => MaybeNext::None,
+        };
     }
     match iter.next() {
         Err(e) => MaybeNext::Some(Err(e.into())),
         Ok(None) => {
-            if let Some((nested, decoded)) = items.pop_front() {
-                MaybeNext::Some(Ok((nested, decoded)))
+            if let Some(decoded) = items.pop_front() {
+                MaybeNext::Some(Ok(decoded))
             } else {
                 MaybeNext::None
             }
         }
         Ok(Some(page)) => {
+            let page = match page {
+                Page::Data(page) => page,
+                Page::Dict(dict_page) => {
+                    *dict = Some(decoder.deserialize_dict(dict_page));
+                    return MaybeNext::More;
+                }
+            };
+
             // there is a new page => consume the page from the start
-            let error = extend(page, init, items, decoder, chunk_size);
+            let error = extend(
+                page,
+                init,
+                items,
+                dict.as_ref(),
+                remaining,
+                decoder,
+                chunk_size,
+            );
             match error {
                 Ok(_) => {}
                 Err(e) => return MaybeNext::Some(Err(e)),
             };
 
-            if items.front().unwrap().0.len() < chunk_size.unwrap_or(0) {
+            if (items.len() == 1)
+                && items.front().unwrap().0.len() < chunk_size.unwrap_or(usize::MAX)
+            {
                 MaybeNext::More
             } else {
-                let (nested, decoded) = items.pop_front().unwrap();
-                MaybeNext::Some(Ok((nested, decoded)))
+                MaybeNext::Some(Ok(items.pop_front().unwrap()))
             }
         }
     }

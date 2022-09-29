@@ -12,8 +12,9 @@ mod array;
 mod common;
 mod deserialize;
 mod error;
+pub(crate) mod file;
 mod read_basic;
-pub(crate) mod reader;
+mod reader;
 mod schema;
 mod stream;
 
@@ -27,11 +28,12 @@ pub mod stream_async;
 #[cfg_attr(docsrs, doc(cfg(feature = "io_ipc_read_async")))]
 pub mod file_async;
 
-pub use common::{read_dictionary, read_record_batch};
-pub use reader::{
-    read_batch, read_file_dictionaries, read_file_metadata, FileMetadata, FileReader,
-};
-pub use schema::deserialize_schema;
+pub(crate) use common::first_dict_field;
+#[cfg(feature = "io_flight")]
+pub(crate) use common::{read_dictionary, read_record_batch};
+pub use file::{read_batch, read_file_dictionaries, read_file_metadata, FileMetadata};
+pub use reader::FileReader;
+pub(crate) use schema::deserialize_schema;
 pub use stream::{read_stream_metadata, StreamMetadata, StreamReader, StreamState};
 
 /// how dictionaries are tracked in this crate

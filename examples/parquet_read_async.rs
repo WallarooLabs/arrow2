@@ -35,15 +35,22 @@ async fn main() -> Result<()> {
     for row_group in &metadata.row_groups {
         // A row group is consumed in two steps: the first step is to read the (compressed)
         // columns into memory, which is IO-bounded.
-        let column_chunks =
-            read::read_columns_many_async(factory, row_group, schema.fields.clone(), None).await?;
+        let column_chunks = read::read_columns_many_async(
+            factory,
+            row_group,
+            schema.fields.clone(),
+            None,
+            None,
+            None,
+        )
+        .await?;
 
         // the second step is to iterate over the columns in chunks.
         // this operation is CPU-bounded and should be sent to a separate thread pool (e.g. `tokio_rayon`) to not block
         // the runtime.
         // Furthermore, this operation is trivially paralellizable e.g. via rayon, as each iterator
         // can be advanced in parallel (parallel decompression and deserialization).
-        let chunks = RowGroupDeserializer::new(column_chunks, row_group.num_rows() as usize, None);
+        let chunks = RowGroupDeserializer::new(column_chunks, row_group.num_rows(), None);
         for maybe_chunk in chunks {
             let chunk = maybe_chunk?;
             println!("{}", chunk.len());

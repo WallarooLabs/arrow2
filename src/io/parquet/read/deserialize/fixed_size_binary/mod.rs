@@ -3,4 +3,4 @@ mod dictionary;
 mod utils;
 
 pub use basic::Iter;
-pub use dictionary::DictIter;
+pub use dictionary::{DictIter, NestedDictIter};

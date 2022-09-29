@@ -5,30 +5,24 @@ use parquet2::deserialize::{
 };
 use parquet2::encoding::hybrid_rle;
 use parquet2::indexes::Interval;
-use parquet2::page::{split_buffer, DataPage};
+use parquet2::page::{split_buffer, DataPage, DictPage, Page};
 use parquet2::schema::Repetition;
 
 use crate::bitmap::utils::BitmapIter;
 use crate::bitmap::MutableBitmap;
 use crate::error::Error;
 
-use super::super::DataPages;
+use super::super::Pages;
 
 pub fn not_implemented(page: &DataPage) -> Error {
     let is_optional = page.descriptor.primitive_type.field_info.repetition == Repetition::Optional;
     let is_filtered = page.selected_rows().is_some();
     let required = if is_optional { "optional" } else { "required" };
     let is_filtered = if is_filtered { ", index-filtered" } else { "" };
-    let dict = if page.dictionary_page().is_some() {
-        ", dictionary-encoded"
-    } else {
-        ""
-    };
     Error::NotYetImplemented(format!(
-        "Decoding {:?} \"{:?}\"-encoded{} {} {} parquet pages",
+        "Decoding {:?} \"{:?}\"-encoded {} {} parquet pages",
         page.descriptor.primitive_type.physical_type,
         page.encoding(),
-        dict,
         required,
         is_filtered,
     ))
@@ -132,7 +126,7 @@ impl<'a> PageValidity<'a> for FilteredOptionalPageValidity<'a> {
             (run, offset)
         } else {
             // a new run
-            let run = self.iter.next()?; // no run -> None
+            let run = self.iter.next()?.unwrap(); // no run -> None
             self.current = Some((run, 0));
             return self.next_limited(limit);
         };
@@ -240,7 +234,7 @@ impl<'a> OptionalPageValidity<'a> {
             (run, offset)
         } else {
             // a new run
-            let run = self.iter.next()?; // no run -> None
+            let run = self.iter.next()?.unwrap(); // no run -> None
             self.current = Some((run, 0));
             return self.next_limited(limit);
         };
@@ -343,98 +337,133 @@ pub(super) trait PageState<'a>: std::fmt::Debug {
 }
 
 /// The state of a partially deserialized page
-pub(super) trait DecodedState<'a>: std::fmt::Debug {
-    // the number of values that this decoder already consumed
+pub(super) trait DecodedState: std::fmt::Debug {
+    // the number of values that the state already has
     fn len(&self) -> usize;
 }
 
 /// A decoder that knows how to map `State` -> Array
 pub(super) trait Decoder<'a> {
+    /// The state that this decoder derives from a [`DataPage`]. This is bound to the page.
     type State: PageState<'a>;
-    type DecodedState: DecodedState<'a>;
+    /// The dictionary representation that the decoder uses
+    type Dict;
+    /// The target state that this Decoder decodes into.
+    type DecodedState: DecodedState;
 
-    fn build_state(&self, page: &'a DataPage) -> Result<Self::State, Error>;
+    /// Creates a new `Self::State`
+    fn build_state(
+        &self,
+        page: &'a DataPage,
+        dict: Option<&'a Self::Dict>,
+    ) -> Result<Self::State, Error>;
 
-    /// Initializes a new state
+    /// Initializes a new [`Self::DecodedState`].
     fn with_capacity(&self, capacity: usize) -> Self::DecodedState;
 
-    /// extends (values, validity) by deserializing items in `State`.
-    /// It guarantees that the length of `values` is at most `values.len() + remaining`.
+    /// extends [`Self::DecodedState`] by deserializing items in [`Self::State`].
+    /// It guarantees that the length of `decoded` is at most `decoded.len() + remaining`.
     fn extend_from_state(
         &self,
         page: &mut Self::State,
         decoded: &mut Self::DecodedState,
         additional: usize,
     );
+
+    /// Deserializes a [`DictPage`] into [`Self::Dict`].
+    fn deserialize_dict(&self, page: &DictPage) -> Self::Dict;
 }
 
 pub(super) fn extend_from_new_page<'a, T: Decoder<'a>>(
     mut page: T::State,
     chunk_size: Option<usize>,
     items: &mut VecDeque<T::DecodedState>,
+    remaining: &mut usize,
     decoder: &T,
 ) {
     let capacity = chunk_size.unwrap_or(0);
     let chunk_size = chunk_size.unwrap_or(usize::MAX);
 
     let mut decoded = if let Some(decoded) = items.pop_back() {
-        // there is a already a state => it must be incomplete...
-        debug_assert!(
-            decoded.len() <= chunk_size,
-            "the temp state is expected to be incomplete"
-        );
         decoded
     } else {
         // there is no state => initialize it
         decoder.with_capacity(capacity)
     };
+    let existing = decoded.len();
 
-    let remaining = chunk_size - decoded.len();
+    let additional = (chunk_size - existing).min(*remaining);
 
-    // extend the current state
-    decoder.extend_from_state(&mut page, &mut decoded, remaining);
-
+    decoder.extend_from_state(&mut page, &mut decoded, additional);
+    *remaining -= decoded.len() - existing;
     items.push_back(decoded);
 
-    while page.len() > 0 {
-        let mut decoded = decoder.with_capacity(capacity);
-        decoder.extend_from_state(&mut page, &mut decoded, chunk_size);
+    while page.len() > 0 && *remaining > 0 {
+        let additional = chunk_size.min(*remaining);
+
+        let mut decoded = decoder.with_capacity(additional);
+        decoder.extend_from_state(&mut page, &mut decoded, additional);
+        *remaining -= decoded.len();
         items.push_back(decoded)
     }
 }
 
+/// Represents what happened when a new page was consumed
 #[derive(Debug)]
 pub enum MaybeNext<P> {
+    /// Whether the page was sufficient to fill `chunk_size`
     Some(P),
+    /// whether there are no more pages or intermediary decoded states
     None,
+    /// Whether the page was insufficient to fill `chunk_size` and a new page is required
     More,
 }
 
 #[inline]
-pub(super) fn next<'a, I: DataPages, D: Decoder<'a>>(
+pub(super) fn next<'a, I: Pages, D: Decoder<'a>>(
     iter: &'a mut I,
-    items: &mut VecDeque<D::DecodedState>,
+    items: &'a mut VecDeque<D::DecodedState>,
+    dict: &'a mut Option<D::Dict>,
+    remaining: &'a mut usize,
     chunk_size: Option<usize>,
-    decoder: &D,
+    decoder: &'a D,
 ) -> MaybeNext<Result<D::DecodedState, Error>> {
     // front[a1, a2, a3, ...]back
     if items.len() > 1 {
-        let item = items.pop_front().unwrap();
-        return MaybeNext::Some(Ok(item));
+        return MaybeNext::Some(Ok(items.pop_front().unwrap()));
     }
+    if (items.len() == 1) && items.front().unwrap().len() == chunk_size.unwrap_or(usize::MAX) {
+        return MaybeNext::Some(Ok(items.pop_front().unwrap()));
+    }
+    if *remaining == 0 {
+        return match items.pop_front() {
+            Some(decoded) => MaybeNext::Some(Ok(decoded)),
+            None => MaybeNext::None,
+        };
+    }
+
     match iter.next() {
         Err(e) => MaybeNext::Some(Err(e.into())),
         Ok(Some(page)) => {
+            let page = match page {
+                Page::Data(page) => page,
+                Page::Dict(dict_page) => {
+                    *dict = Some(decoder.deserialize_dict(dict_page));
+                    return MaybeNext::More;
+                }
+            };
+
             // there is a new page => consume the page from the start
-            let maybe_page = decoder.build_state(page);
+            let maybe_page = decoder.build_state(page, dict.as_ref());
             let page = match maybe_page {
                 Ok(page) => page,
                 Err(e) => return MaybeNext::Some(Err(e)),
             };
 
-            extend_from_new_page(page, chunk_size, items, decoder);
+            extend_from_new_page(page, chunk_size, items, remaining, decoder);
 
-            if (items.len() == 1) && items.front().unwrap().len() < chunk_size.unwrap_or(0) {
+            if (items.len() == 1) && items.front().unwrap().len() < chunk_size.unwrap_or(usize::MAX)
+            {
                 MaybeNext::More
             } else {
                 let decoded = items.pop_front().unwrap();
@@ -463,9 +492,6 @@ pub(super) fn dict_indices_decoder(page: &DataPage) -> Result<hybrid_rle::Hybrid
     let bit_width = indices_buffer[0];
     let indices_buffer = &indices_buffer[1..];
 
-    Ok(hybrid_rle::HybridRleDecoder::new(
-        indices_buffer,
-        bit_width as u32,
-        page.num_values(),
-    ))
+    hybrid_rle::HybridRleDecoder::try_new(indices_buffer, bit_width as u32, page.num_values())
+        .map_err(Error::from)
 }

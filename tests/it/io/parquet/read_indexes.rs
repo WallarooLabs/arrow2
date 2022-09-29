@@ -1,9 +1,9 @@
 use std::io::Cursor;
 
+use arrow2::chunk::Chunk;
 use arrow2::error::Error;
+use arrow2::io::parquet::read::indexes;
 use arrow2::{array::*, datatypes::*, error::Result, io::parquet::read::*, io::parquet::write::*};
-use parquet2::indexes::{compute_rows, select_pages};
-use parquet2::read::IndexedPageReader;
 
 /// Returns 2 sets of pages with different the same number of rows distributed un-evenly
 fn pages(
@@ -41,7 +41,7 @@ fn pages(
                     .descriptor
                     .primitive_type
                     .clone(),
-                vec![Nested::Primitive(None, true, array.len())],
+                &[Nested::Primitive(None, true, array.len())],
                 options,
                 Encoding::Plain,
             )
@@ -57,7 +57,7 @@ fn pages(
                     .descriptor
                     .primitive_type
                     .clone(),
-                vec![Nested::Primitive(None, true, array.len())],
+                &[Nested::Primitive(None, true, array.len())],
                 options,
                 encoding,
             )
@@ -103,31 +103,56 @@ fn read_with_indexes(
 
     let schema = infer_schema(&metadata)?;
 
-    let row_group = &metadata.row_groups[0];
+    // row group-based filtering can be done here
+    let row_groups = metadata.row_groups;
 
-    let pages = read_pages_locations(&mut reader, row_group.columns())?;
+    // one per row group
+    let pages = row_groups
+        .iter()
+        .map(|row_group| {
+            assert!(indexes::has_indexes(row_group));
 
-    // say we concluded from the indexes that we only needed the "6" from the first column, so second page.
-    let _indexes = read_columns_indexes(&mut reader, row_group.columns(), &schema.fields)?;
-    let intervals = compute_rows(&[false, true, false], &pages[0], row_group.num_rows())?;
+            indexes::read_filtered_pages(&mut reader, row_group, &schema.fields, |_, intervals| {
+                let first_field = &intervals[0];
+                let first_field_column = &first_field[0];
+                assert_eq!(first_field_column.len(), 3);
+                let selection = [false, true, false];
 
-    // based on the intervals from c1, we compute which pages from the second column are required:
-    let pages = select_pages(&intervals, &pages[1], row_group.num_rows())?;
+                first_field_column
+                    .iter()
+                    .zip(selection)
+                    .filter_map(|(i, is_selected)| is_selected.then(|| *i))
+                    .collect()
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    // and read them:
-    let c1 = &metadata.row_groups[0].columns()[1];
+    // apply projection pushdown
+    let schema = schema.filter(|index, _| index == 1);
+    let pages = pages
+        .into_iter()
+        .map(|pages| {
+            pages
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| *index == 1)
+                .map(|(_, pages)| pages)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
-    let pages = IndexedPageReader::new(reader, c1, pages, vec![], vec![]);
-    let pages = BasicDecompressor::new(pages, vec![]);
+    let expected = Chunk::new(vec![expected]);
 
-    let arrays = column_iter_to_arrays(
-        vec![pages],
-        vec![&c1.descriptor().descriptor.primitive_type],
-        schema.fields[1].clone(),
-        Some(row_group.num_rows() as usize),
-    )?;
+    let chunks = FileReader::new(
+        reader,
+        row_groups,
+        schema,
+        Some(1024 * 8 * 8),
+        None,
+        Some(pages),
+    );
 
-    let arrays = arrays.collect::<Result<Vec<_>>>()?;
+    let arrays = chunks.collect::<Result<Vec<_>>>()?;
 
     assert_eq!(arrays, vec![expected]);
     Ok(())
@@ -140,6 +165,18 @@ fn indexed_required_utf8() -> Result<()> {
     let expected = Utf8Array::<i32>::from_slice(["e"]).boxed();
 
     read_with_indexes(pages(&[&array21, &array22], Encoding::Plain)?, expected)
+}
+
+#[test]
+fn indexed_required_utf8_delta() -> Result<()> {
+    let array21 = Utf8Array::<i32>::from_slice(["a", "b", "c"]);
+    let array22 = Utf8Array::<i32>::from_slice(["d", "e", "f"]);
+    let expected = Utf8Array::<i32>::from_slice(["e"]).boxed();
+
+    read_with_indexes(
+        pages(&[&array21, &array22], Encoding::DeltaLengthByteArray)?,
+        expected,
+    )
 }
 
 #[test]
@@ -161,12 +198,48 @@ fn indexed_optional_i32() -> Result<()> {
 }
 
 #[test]
+fn indexed_optional_i32_delta() -> Result<()> {
+    let array21 = Int32Array::from([Some(1), Some(2), None]);
+    let array22 = Int32Array::from([None, Some(5), Some(6)]);
+    let expected = Int32Array::from_slice([5]).boxed();
+
+    read_with_indexes(
+        pages(&[&array21, &array22], Encoding::DeltaBinaryPacked)?,
+        expected,
+    )
+}
+
+#[test]
+fn indexed_required_i32_delta() -> Result<()> {
+    let array21 = Int32Array::from_slice([1, 2, 3]);
+    let array22 = Int32Array::from_slice([4, 5, 6]);
+    let expected = Int32Array::from_slice([5]).boxed();
+
+    read_with_indexes(
+        pages(&[&array21, &array22], Encoding::DeltaBinaryPacked)?,
+        expected,
+    )
+}
+
+#[test]
 fn indexed_optional_utf8() -> Result<()> {
     let array21 = Utf8Array::<i32>::from([Some("a"), Some("b"), None]);
     let array22 = Utf8Array::<i32>::from([None, Some("e"), Some("f")]);
     let expected = Utf8Array::<i32>::from_slice(["e"]).boxed();
 
     read_with_indexes(pages(&[&array21, &array22], Encoding::Plain)?, expected)
+}
+
+#[test]
+fn indexed_optional_utf8_delta() -> Result<()> {
+    let array21 = Utf8Array::<i32>::from([Some("a"), Some("b"), None]);
+    let array22 = Utf8Array::<i32>::from([None, Some("e"), Some("f")]);
+    let expected = Utf8Array::<i32>::from_slice(["e"]).boxed();
+
+    read_with_indexes(
+        pages(&[&array21, &array22], Encoding::DeltaLengthByteArray)?,
+        expected,
+    )
 }
 
 #[test]
