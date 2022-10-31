@@ -1,6 +1,6 @@
 [package]
 name = "arrow2"
-version = "0.12.0"
+version = "0.14.1"
 license = "Apache-2.0"
 description = "Unofficial implementation of Apache Arrow spec in safe Rust"
 homepage = "https://github.com/jorgecarleitao/arrow2"
@@ -21,14 +21,22 @@ num-traits = "0.2"
 dyn-clone = "1"
 bytemuck = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", default_features = false, features = ["std"] }
-chrono-tz = { version = "0.6", optional = true }
-# To efficiently cast numbers to strings
-lexical-core = { version = "0.8", optional = true }
+
+# for decimal i256
+ethnum = "1"
+
 # We need to Hash values before sending them to an hasher. This
 # crate provides HashMap that assumes pre-hashed values.
 hash_hasher = "^2.0.3"
 # For SIMD utf8 validation
 simdutf8 = "0.1.3"
+# faster hashing
+ahash = { version = "0.7" }
+
+# for timezone support
+chrono-tz = { version = "0.6", optional = true }
+# To efficiently cast numbers to strings
+lexical-core = { version = "0.8", optional = true }
 
 # for csv io
 csv = { version = "^1.1", optional = true }
@@ -38,10 +46,11 @@ csv-core = { version = "0.1", optional = true }
 csv-async = { version = "^1.1", optional = true }
 
 regex = { version = "^1.3", optional = true }
+regex-syntax = { version = "^0.6", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 fallible-streaming-iterator = { version = "0.1", optional = true }
 
-json-deserializer = { version = "0.3", optional = true }
+json-deserializer = { version = "0.4.1", optional = true, features = ["preserve_order"] }
 indexmap = { version = "^1.6", optional = true }
 
 # used to print columns in a nice columnar format
@@ -64,23 +73,22 @@ base64 = { version = "0.13.0", optional = true }
 # to write to parquet as a stream
 futures = { version = "0.3", optional = true }
 
-# for faster hashing
-ahash = { version = "0.7" }
+# to read IPC as a stream
+async-stream = { version = "0.3.2", optional = true }
 
 # parquet support
-parquet2 = { version = "0.14.0", optional = true, default_features = false }
+parquet2 = { version = "0.16", optional = true, default_features = false, features = ["async"] }
 
 # avro support
-avro-schema = { version = "0.2", optional = true }
+avro-schema = { version = "0.3", optional = true }
+
+# ORC support
+orc-format = { version = "0.3.0", optional = true }
+
+# Arrow integration tests support
 serde = { version = "^1.0", features = ["rc"], optional = true }
 serde_derive = { version = "^1.0", optional = true }
 serde_json = { version = "^1.0", features = ["preserve_order"], optional = true }
-# compression of avro
-libflate = { version = "1.1.1", optional = true }
-snap = { version = "1", optional = true }
-crc = { version = "2", optional = true }
-# async avro
-async-stream = { version = "0.3.2", optional = true }
 
 # for division/remainder optimization at runtime
 strength_reduce = { version = "0.2", optional = true }
@@ -126,9 +134,11 @@ full = [
     "io_parquet",
     "io_parquet_compression",
     "io_avro",
+    "io_orc",
     "io_avro_compression",
     "io_avro_async",
     "regex",
+    "regex-syntax",
     "compute",
     # parses timezones used in timestamp conversions
     "chrono-tz",
@@ -145,22 +155,34 @@ io_ipc_write_async = ["io_ipc", "futures"]
 io_ipc_read_async = ["io_ipc", "futures", "async-stream"]
 io_ipc_compression = ["lz4", "zstd"]
 io_flight = ["io_ipc", "arrow-format/flight-data"]
+
 # base64 + io_ipc because arrow schemas are stored as base64-encoded ipc format.
 io_parquet = ["parquet2", "io_ipc", "base64", "futures", "streaming-iterator", "fallible-streaming-iterator"]
+
 io_parquet_compression = [
-    "parquet2/zstd",
-    "parquet2/snappy",
-    "parquet2/gzip",
-    "parquet2/lz4",
-    "parquet2/brotli",
+    "io_parquet_zstd",
+    "io_parquet_gzip",
+    "io_parquet_snappy",
+    "io_parquet_lz4",
+    "io_parquet_brotli"
 ]
-io_avro = ["avro-schema", "streaming-iterator", "fallible-streaming-iterator", "serde_json"]
+
+# compression backends
+io_parquet_zstd = ["parquet2/zstd"]
+io_parquet_snappy = ["parquet2/snappy"]
+io_parquet_gzip = ["parquet2/gzip"]
+io_parquet_lz4_flex = ["parquet2/lz4_flex"]
+io_parquet_lz4 = ["parquet2/lz4"]
+io_parquet_brotli = ["parquet2/brotli"]
+
+io_avro = ["avro-schema", "streaming-iterator"]
 io_avro_compression = [
-    "libflate",
-    "snap",
-    "crc",
+    "avro-schema/compression",
 ]
-io_avro_async = ["io_avro", "futures", "async-stream"]
+io_avro_async = ["avro-schema/async"]
+
+io_orc = [ "orc-format" ]
+
 # serde+serde_json: its dependencies + error handling
 # serde_derive: there is some derive around
 io_json_integration = ["hex", "serde", "serde_derive", "serde_json", "io_ipc"]
@@ -179,7 +201,7 @@ compute_filter = []
 compute_hash = ["multiversion"]
 compute_if_then_else = []
 compute_length = []
-compute_like = ["regex"]
+compute_like = ["regex", "regex-syntax"]
 compute_limit = []
 compute_merge_sort = ["itertools", "compute_sort"]
 compute_nullif = ["compute_comparison"]

@@ -1,18 +1,14 @@
 use std::io::{Read, Seek};
-use std::sync::Arc;
+
+use parquet2::indexes::FilteredPage;
 
 use crate::array::Array;
 use crate::chunk::Chunk;
 use crate::datatypes::Schema;
+use crate::error::Result;
 use crate::io::parquet::read::read_columns_many;
-use crate::{
-    datatypes::Field,
-    error::{Error, Result},
-};
 
-use super::{infer_schema, read_metadata, FileMetaData, RowGroupDeserializer, RowGroupMetaData};
-
-type GroupFilter = Arc<dyn Fn(usize, &RowGroupMetaData) -> bool + Send + Sync>;
+use super::{RowGroupDeserializer, RowGroupMetaData};
 
 /// An iterator of [`Chunk`]s coming from row groups of a parquet file.
 ///
@@ -20,96 +16,31 @@ type GroupFilter = Arc<dyn Fn(usize, &RowGroupMetaData) -> bool + Send + Sync>;
 /// mapped to an [`Iterator<Item=Chunk>`] and each iterator is iterated upon until either the limit
 /// or the last iterator ends.
 /// # Implementation
-/// This iterator mixes IO-bounded and CPU-bounded operations.
+/// This iterator is single threaded on both IO-bounded and CPU-bounded tasks, and mixes them.
 pub struct FileReader<R: Read + Seek> {
     row_groups: RowGroupReader<R>,
-    metadata: FileMetaData,
     remaining_rows: usize,
     current_row_group: Option<RowGroupDeserializer>,
 }
 
 impl<R: Read + Seek> FileReader<R> {
-    /// Creates a new [`FileReader`] by reading the metadata from `reader` and constructing
-    /// Arrow's schema from it.
-    ///
-    /// # Error
-    /// This function errors iff:
-    /// * reading the metadata from the reader fails
-    /// * it is not possible to derive an arrow schema from the parquet file
-    /// * the projection contains columns that do not exist
-    pub fn try_new(
-        mut reader: R,
-        projection: Option<&[usize]>,
+    /// Returns a new [`FileReader`].
+    pub fn new(
+        reader: R,
+        row_groups: Vec<RowGroupMetaData>,
+        schema: Schema,
         chunk_size: Option<usize>,
         limit: Option<usize>,
-        groups_filter: Option<GroupFilter>,
-    ) -> Result<Self> {
-        let metadata = read_metadata(&mut reader)?;
+        page_indexes: Option<Vec<Vec<Vec<Vec<FilteredPage>>>>>,
+    ) -> Self {
+        let row_groups =
+            RowGroupReader::new(reader, schema, row_groups, chunk_size, limit, page_indexes);
 
-        let schema = infer_schema(&metadata)?;
-
-        let schema_metadata = schema.metadata;
-        let fields: Vec<Field> = if let Some(projection) = &projection {
-            schema
-                .fields
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, f)| {
-                    if projection.iter().any(|&i| i == index) {
-                        Some(f)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            schema.fields.into_iter().collect()
-        };
-
-        if let Some(projection) = &projection {
-            if fields.len() != projection.len() {
-                return Err(Error::InvalidArgumentError(
-                    "While reading parquet, some columns in the projection do not exist in the file"
-                        .to_string(),
-                ));
-            }
-        }
-
-        let schema = Schema {
-            fields,
-            metadata: schema_metadata,
-        };
-
-        let row_groups = RowGroupReader::new(
-            reader,
-            schema,
-            groups_filter,
-            metadata.row_groups.clone(),
-            chunk_size,
-            limit,
-        );
-
-        Ok(Self {
+        Self {
             row_groups,
-            metadata,
             remaining_rows: limit.unwrap_or(usize::MAX),
             current_row_group: None,
-        })
-    }
-
-    /// Returns the derived arrow [`Schema`] of the file
-    pub fn schema(&self) -> &Schema {
-        &self.row_groups.schema
-    }
-
-    /// Returns parquet's [`FileMetaData`].
-    pub fn metadata(&self) -> &FileMetaData {
-        &self.metadata
-    }
-
-    /// Sets the groups filter
-    pub fn set_groups_filter(&mut self, groups_filter: GroupFilter) {
-        self.row_groups.set_groups_filter(groups_filter);
+        }
     }
 
     fn next_row_group(&mut self) -> Result<Option<RowGroupDeserializer>> {
@@ -125,6 +56,11 @@ impl<R: Read + Seek> FileReader<R> {
             );
         }
         Ok(result)
+    }
+
+    /// Returns the [`Schema`] associated to this file.
+    pub fn schema(&self) -> &Schema {
+        &self.row_groups.schema
     }
 }
 
@@ -178,11 +114,10 @@ impl<R: Read + Seek> Iterator for FileReader<R> {
 pub struct RowGroupReader<R: Read + Seek> {
     reader: R,
     schema: Schema,
-    groups_filter: Option<GroupFilter>,
-    row_groups: Vec<RowGroupMetaData>,
+    row_groups: std::vec::IntoIter<RowGroupMetaData>,
     chunk_size: Option<usize>,
     remaining_rows: usize,
-    current_group: usize,
+    page_indexes: Option<std::vec::IntoIter<Vec<Vec<Vec<FilteredPage>>>>>,
 }
 
 impl<R: Read + Seek> RowGroupReader<R> {
@@ -190,25 +125,22 @@ impl<R: Read + Seek> RowGroupReader<R> {
     pub fn new(
         reader: R,
         schema: Schema,
-        groups_filter: Option<GroupFilter>,
         row_groups: Vec<RowGroupMetaData>,
         chunk_size: Option<usize>,
         limit: Option<usize>,
+        page_indexes: Option<Vec<Vec<Vec<Vec<FilteredPage>>>>>,
     ) -> Self {
+        if let Some(pages) = &page_indexes {
+            assert_eq!(pages.len(), row_groups.len())
+        }
         Self {
             reader,
             schema,
-            groups_filter,
-            row_groups,
+            row_groups: row_groups.into_iter(),
             chunk_size,
             remaining_rows: limit.unwrap_or(usize::MAX),
-            current_group: 0,
+            page_indexes: page_indexes.map(|pages| pages.into_iter()),
         }
-    }
-
-    /// Sets the groups filter
-    pub fn set_groups_filter(&mut self, groups_filter: GroupFilter) {
-        self.groups_filter = Some(groups_filter);
     }
 
     #[inline]
@@ -216,40 +148,47 @@ impl<R: Read + Seek> RowGroupReader<R> {
         if self.schema.fields.is_empty() {
             return Ok(None);
         }
-        if self.current_group == self.row_groups.len() {
-            // reached the last row group
-            return Ok(None);
-        };
         if self.remaining_rows == 0 {
             // reached the limit
             return Ok(None);
         }
 
-        let current_row_group = self.current_group;
-        let row_group = &self.row_groups[current_row_group];
-        if let Some(groups_filter) = self.groups_filter.as_ref() {
-            if !(groups_filter)(current_row_group, row_group) {
-                self.current_group += 1;
-                return self._next();
-            }
-        }
-        self.current_group += 1;
+        let row_group = if let Some(row_group) = self.row_groups.next() {
+            row_group
+        } else {
+            return Ok(None);
+        };
+
+        let pages = self.page_indexes.as_mut().and_then(|iter| iter.next());
+
+        // the number of rows depends on whether indexes are selected or not.
+        let num_rows = pages
+            .as_ref()
+            .map(|x| {
+                // first field, first column within that field
+                x[0][0]
+                    .iter()
+                    .map(|page| {
+                        page.selected_rows
+                            .iter()
+                            .map(|interval| interval.length)
+                            .sum::<usize>()
+                    })
+                    .sum()
+            })
+            .unwrap_or_else(|| row_group.num_rows());
 
         let column_chunks = read_columns_many(
             &mut self.reader,
-            row_group,
+            &row_group,
             self.schema.fields.clone(),
             self.chunk_size,
+            Some(self.remaining_rows),
+            pages,
         )?;
 
-        let result = RowGroupDeserializer::new(
-            column_chunks,
-            row_group.num_rows() as usize,
-            Some(self.remaining_rows),
-        );
-        self.remaining_rows = self
-            .remaining_rows
-            .saturating_sub(row_group.num_rows() as usize);
+        let result = RowGroupDeserializer::new(column_chunks, num_rows, Some(self.remaining_rows));
+        self.remaining_rows = self.remaining_rows.saturating_sub(num_rows);
         Ok(Some(result))
     }
 }
@@ -262,7 +201,6 @@ impl<R: Read + Seek> Iterator for RowGroupReader<R> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.row_groups.len() - self.current_group;
-        (len, Some(len))
+        self.row_groups.size_hint()
     }
 }

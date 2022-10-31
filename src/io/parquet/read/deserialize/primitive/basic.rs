@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use parquet2::{
     deserialize::SliceFilteredIter,
     encoding::{hybrid_rle, Encoding},
-    page::{split_buffer, DataPage, PrimitivePageDict},
+    page::{split_buffer, DataPage, DictPage},
     schema::Repetition,
     types::decode,
     types::NativeType as ParquetNativeType,
@@ -16,10 +16,10 @@ use crate::{
 
 use super::super::utils;
 use super::super::utils::{get_selected_rows, FilteredOptionalPageValidity, OptionalPageValidity};
-use super::super::DataPages;
+use super::super::Pages;
 
 #[derive(Debug)]
-struct FilteredRequiredValues<'a> {
+pub(super) struct FilteredRequiredValues<'a> {
     values: SliceFilteredIter<std::slice::ChunksExact<'a, u8>>,
 }
 
@@ -63,25 +63,22 @@ impl<'a> Values<'a> {
 }
 
 #[derive(Debug)]
-pub(super) struct ValuesDictionary<'a, P>
+pub(super) struct ValuesDictionary<'a, T>
 where
-    P: ParquetNativeType,
+    T: NativeType,
 {
     pub values: hybrid_rle::HybridRleDecoder<'a>,
-    pub dict: &'a [P],
+    pub dict: &'a Vec<T>,
 }
 
-impl<'a, P> ValuesDictionary<'a, P>
+impl<'a, T> ValuesDictionary<'a, T>
 where
-    P: ParquetNativeType,
+    T: NativeType,
 {
-    pub fn try_new(page: &'a DataPage, dict: &'a PrimitivePageDict<P>) -> Result<Self> {
+    pub fn try_new(page: &'a DataPage, dict: &'a Vec<T>) -> Result<Self> {
         let values = utils::dict_indices_decoder(page)?;
 
-        Ok(Self {
-            dict: dict.values(),
-            values,
-        })
+        Ok(Self { dict, values })
     }
 
     #[inline]
@@ -92,21 +89,21 @@ where
 
 // The state of a `DataPage` of `Primitive` parquet primitive type
 #[derive(Debug)]
-enum State<'a, P>
+pub(super) enum State<'a, T>
 where
-    P: ParquetNativeType,
+    T: NativeType,
 {
     Optional(OptionalPageValidity<'a>, Values<'a>),
     Required(Values<'a>),
-    RequiredDictionary(ValuesDictionary<'a, P>),
-    OptionalDictionary(OptionalPageValidity<'a>, ValuesDictionary<'a, P>),
+    RequiredDictionary(ValuesDictionary<'a, T>),
+    OptionalDictionary(OptionalPageValidity<'a>, ValuesDictionary<'a, T>),
     FilteredRequired(FilteredRequiredValues<'a>),
     FilteredOptional(FilteredOptionalPageValidity<'a>, Values<'a>),
 }
 
-impl<'a, P> utils::PageState<'a> for State<'a, P>
+impl<'a, T> utils::PageState<'a> for State<'a, T>
 where
-    P: ParquetNativeType,
+    T: NativeType,
 {
     fn len(&self) -> usize {
         match self {
@@ -121,7 +118,7 @@ where
 }
 
 #[derive(Debug)]
-struct PrimitiveDecoder<T, P, F>
+pub(super) struct PrimitiveDecoder<T, P, F>
 where
     T: NativeType,
     P: ParquetNativeType,
@@ -129,7 +126,7 @@ where
 {
     phantom: std::marker::PhantomData<T>,
     phantom_p: std::marker::PhantomData<P>,
-    op: F,
+    pub op: F,
 }
 
 impl<T, P, F> PrimitiveDecoder<T, P, F>
@@ -139,7 +136,7 @@ where
     F: Fn(P) -> T,
 {
     #[inline]
-    fn new(op: F) -> Self {
+    pub(super) fn new(op: F) -> Self {
         Self {
             phantom: std::marker::PhantomData,
             phantom_p: std::marker::PhantomData,
@@ -148,7 +145,7 @@ where
     }
 }
 
-impl<'a, T: std::fmt::Debug> utils::DecodedState<'a> for (Vec<T>, MutableBitmap) {
+impl<T: std::fmt::Debug> utils::DecodedState for (Vec<T>, MutableBitmap) {
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -160,27 +157,20 @@ where
     P: ParquetNativeType,
     F: Copy + Fn(P) -> T,
 {
-    type State = State<'a, P>;
+    type State = State<'a, T>;
+    type Dict = Vec<T>;
     type DecodedState = (Vec<T>, MutableBitmap);
 
-    fn build_state(&self, page: &'a DataPage) -> Result<Self::State> {
+    fn build_state(&self, page: &'a DataPage, dict: Option<&'a Self::Dict>) -> Result<Self::State> {
         let is_optional =
             page.descriptor.primitive_type.field_info.repetition == Repetition::Optional;
         let is_filtered = page.selected_rows().is_some();
 
-        match (
-            page.encoding(),
-            page.dictionary_page(),
-            is_optional,
-            is_filtered,
-        ) {
+        match (page.encoding(), dict, is_optional, is_filtered) {
             (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), false, false) => {
-                let dict = dict.as_any().downcast_ref().unwrap();
                 ValuesDictionary::try_new(page, dict).map(State::RequiredDictionary)
             }
             (Encoding::PlainDictionary | Encoding::RleDictionary, Some(dict), true, false) => {
-                let dict = dict.as_any().downcast_ref().unwrap();
-
                 Ok(State::OptionalDictionary(
                     OptionalPageValidity::try_new(page)?,
                     ValuesDictionary::try_new(page, dict)?,
@@ -193,9 +183,9 @@ where
                 Ok(State::Optional(validity, values))
             }
             (Encoding::Plain, _, false, false) => Ok(State::Required(Values::try_new::<P>(page)?)),
-            (Encoding::Plain, _, false, true) => Ok(State::FilteredRequired(
-                FilteredRequiredValues::try_new::<P>(page)?,
-            )),
+            (Encoding::Plain, _, false, true) => {
+                FilteredRequiredValues::try_new::<P>(page).map(State::FilteredRequired)
+            }
             (Encoding::Plain, _, true, true) => Ok(State::FilteredOptional(
                 FilteredOptionalPageValidity::try_new(page)?,
                 Values::try_new::<P>(page)?,
@@ -242,12 +232,18 @@ where
                     page_validity,
                     Some(remaining),
                     values,
-                    &mut page_values.values.by_ref().map(op1).map(self.op),
+                    &mut page_values.values.by_ref().map(|x| x.unwrap()).map(op1),
                 )
             }
             State::RequiredDictionary(page) => {
                 let op1 = |index: u32| page.dict[index as usize];
-                values.extend(page.values.by_ref().map(op1).map(self.op).take(remaining));
+                values.extend(
+                    page.values
+                        .by_ref()
+                        .map(|x| x.unwrap())
+                        .map(op1)
+                        .take(remaining),
+                );
             }
             State::FilteredRequired(page) => {
                 values.extend(
@@ -269,6 +265,10 @@ where
             }
         }
     }
+
+    fn deserialize_dict(&self, page: &DictPage) -> Self::Dict {
+        deserialize_plain(&page.buffer, self.op)
+    }
 }
 
 pub(super) fn finish<T: NativeType>(
@@ -284,11 +284,11 @@ pub(super) fn finish<T: NativeType>(
     MutablePrimitiveArray::from_data(data_type.clone(), values, validity)
 }
 
-/// An iterator adapter over [`DataPages`] assumed to be encoded as primitive arrays
+/// An [`Iterator`] adapter over [`Pages`] assumed to be encoded as primitive arrays
 #[derive(Debug)]
 pub struct Iter<T, I, P, F>
 where
-    I: DataPages,
+    I: Pages,
     T: NativeType,
     P: ParquetNativeType,
     F: Fn(P) -> T,
@@ -296,24 +296,34 @@ where
     iter: I,
     data_type: DataType,
     items: VecDeque<(Vec<T>, MutableBitmap)>,
+    remaining: usize,
     chunk_size: Option<usize>,
+    dict: Option<Vec<T>>,
     op: F,
     phantom: std::marker::PhantomData<P>,
 }
 
 impl<T, I, P, F> Iter<T, I, P, F>
 where
-    I: DataPages,
+    I: Pages,
     T: NativeType,
 
     P: ParquetNativeType,
     F: Copy + Fn(P) -> T,
 {
-    pub fn new(iter: I, data_type: DataType, chunk_size: Option<usize>, op: F) -> Self {
+    pub fn new(
+        iter: I,
+        data_type: DataType,
+        num_rows: usize,
+        chunk_size: Option<usize>,
+        op: F,
+    ) -> Self {
         Self {
             iter,
             data_type,
             items: VecDeque::new(),
+            dict: None,
+            remaining: num_rows,
             chunk_size,
             op,
             phantom: Default::default(),
@@ -323,7 +333,7 @@ where
 
 impl<T, I, P, F> Iterator for Iter<T, I, P, F>
 where
-    I: DataPages,
+    I: Pages,
     T: NativeType,
     P: ParquetNativeType,
     F: Copy + Fn(P) -> T,
@@ -334,6 +344,8 @@ where
         let maybe_state = utils::next(
             &mut self.iter,
             &mut self.items,
+            &mut self.dict,
+            &mut self.remaining,
             self.chunk_size,
             &PrimitiveDecoder::new(self.op),
         );
@@ -346,4 +358,17 @@ where
             utils::MaybeNext::More => self.next(),
         }
     }
+}
+
+pub(super) fn deserialize_plain<T, P, F>(values: &[u8], op: F) -> Vec<T>
+where
+    T: NativeType,
+    P: ParquetNativeType,
+    F: Copy + Fn(P) -> T,
+{
+    values
+        .chunks_exact(std::mem::size_of::<P>())
+        .map(decode)
+        .map(op)
+        .collect::<Vec<_>>()
 }

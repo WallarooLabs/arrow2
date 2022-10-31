@@ -9,6 +9,8 @@ use super::{new_empty_array, new_null_array, Array};
 mod ffi;
 pub(super) mod fmt;
 mod iterator;
+mod mutable;
+pub use mutable::*;
 
 /// A [`StructArray`] is a nested [`Array`] with an optional validity representing
 /// multiple [`Array`] with the same number of rows.
@@ -54,7 +56,7 @@ impl StructArray {
         }
         if fields.len() != values.len() {
             return Err(Error::oos(
-                "A StructArray must a number of fields in its DataType equal to the number of child values",
+                "A StructArray must have a number of fields in its DataType equal to the number of child values",
             ));
         }
 
@@ -81,7 +83,7 @@ impl StructArray {
             .try_for_each(|(index, a_len)| {
                 if a_len != len {
                     Err(Error::oos(format!(
-                        "The children DataTypes of a StructArray must equal the children data types.
+                        "The children must have an equal number of values.
                          However, the values at index {index} have a length of {a_len}, which is different from values at index 0, {len}."
                     )))
                 } else {

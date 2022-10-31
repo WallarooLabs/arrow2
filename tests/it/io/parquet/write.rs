@@ -92,6 +92,28 @@ fn int64_optional_v2() -> Result<()> {
     )
 }
 
+#[test]
+fn int64_optional_delta() -> Result<()> {
+    round_trip(
+        "int64",
+        "nullable",
+        Version::V2,
+        CompressionOptions::Uncompressed,
+        vec![Encoding::DeltaBinaryPacked],
+    )
+}
+
+#[test]
+fn int64_required_delta() -> Result<()> {
+    round_trip(
+        "int64",
+        "required",
+        Version::V2,
+        CompressionOptions::Uncompressed,
+        vec![Encoding::DeltaBinaryPacked],
+    )
+}
+
 #[cfg(feature = "io_parquet_compression")]
 #[test]
 fn int64_optional_v2_compressed() -> Result<()> {
@@ -339,11 +361,21 @@ fn list_large_binary_optional_v1() -> Result<()> {
 }
 
 #[test]
-#[ignore]
 fn utf8_optional_v2_delta() -> Result<()> {
     round_trip(
         "string",
         "nullable",
+        Version::V2,
+        CompressionOptions::Uncompressed,
+        vec![Encoding::DeltaLengthByteArray],
+    )
+}
+
+#[test]
+fn utf8_required_v2_delta() -> Result<()> {
+    round_trip(
+        "string",
+        "required",
         Version::V2,
         CompressionOptions::Uncompressed,
         vec![Encoding::DeltaLengthByteArray],

@@ -4,6 +4,7 @@ use crate::{
     datatypes::{DataType, Field},
     error::Error,
 };
+use std::sync::Arc;
 
 use super::{
     new_empty_array,
@@ -126,8 +127,8 @@ impl<O: Offset> ListArray<O> {
     }
 
     /// Boxes self into a [`Arc<dyn Array>`].
-    pub fn arced(self) -> std::sync::Arc<dyn Array> {
-        std::sync::Arc::new(self)
+    pub fn arced(self) -> Arc<dyn Array> {
+        Arc::new(self)
     }
 }
 
@@ -324,7 +325,7 @@ impl<O: Offset> ListArray<O> {
     /// Returns a the inner [`Field`]
     /// # Errors
     /// Panics iff the logical type is not consistent with this struct.
-    fn try_get_child(data_type: &DataType) -> Result<&Field, Error> {
+    pub fn try_get_child(data_type: &DataType) -> Result<&Field, Error> {
         if O::IS_LARGE {
             match data_type.to_logical_type() {
                 DataType::LargeList(child) => Ok(child.as_ref()),

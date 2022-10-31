@@ -18,7 +18,7 @@ pub fn array_to_page<T, R>(
     array: &PrimitiveArray<T>,
     options: WriteOptions,
     type_: PrimitiveType,
-    nested: Vec<Nested>,
+    nested: &[Nested],
 ) -> Result<DataPage>
 where
     T: ArrowNativeType,
@@ -29,9 +29,9 @@ where
 
     let mut buffer = vec![];
     let (repetition_levels_byte_length, definition_levels_byte_length) =
-        nested::write_rep_and_def(options.version, &nested, &mut buffer)?;
+        nested::write_rep_and_def(options.version, nested, &mut buffer)?;
 
-    encode_plain(array, is_optional, &mut buffer);
+    let buffer = encode_plain(array, is_optional, buffer);
 
     let statistics = if options.write_statistics {
         Some(serialize_statistics(&build_statistics(
@@ -44,7 +44,7 @@ where
 
     utils::build_plain_page(
         buffer,
-        nested::num_values(&nested),
+        nested::num_values(nested),
         nested[0].len(),
         array.null_count(),
         repetition_levels_byte_length,

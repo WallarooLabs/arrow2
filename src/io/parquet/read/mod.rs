@@ -3,7 +3,7 @@
 
 mod deserialize;
 mod file;
-mod indexes;
+pub mod indexes;
 mod row_group;
 pub mod schema;
 pub mod statistics;
@@ -17,7 +17,7 @@ pub use parquet2::{
     error::Error as ParquetError,
     fallible_streaming_iterator,
     metadata::{ColumnChunkMetaData, ColumnDescriptor, RowGroupMetaData},
-    page::{CompressedDataPage, DataPage, DataPageHeader},
+    page::{CompressedDataPage, DataPageHeader, Page},
     read::{
         decompress, get_column_iterator, get_page_stream,
         read_columns_indexes as _read_columns_indexes, read_metadata as _read_metadata,
@@ -37,20 +37,16 @@ use crate::{array::Array, error::Result};
 
 pub use deserialize::{column_iter_to_arrays, get_page_iterator};
 pub use file::{FileReader, RowGroupReader};
-pub use indexes::{read_columns_indexes, ColumnIndex};
 pub use row_group::*;
 pub use schema::{infer_schema, FileMetaData};
 
-/// Trait describing a [`FallibleStreamingIterator`] of [`DataPage`]
-pub trait DataPages:
-    FallibleStreamingIterator<Item = DataPage, Error = ParquetError> + Send + Sync
+/// Trait describing a [`FallibleStreamingIterator`] of [`Page`]
+pub trait Pages:
+    FallibleStreamingIterator<Item = Page, Error = ParquetError> + Send + Sync
 {
 }
 
-impl<I: FallibleStreamingIterator<Item = DataPage, Error = ParquetError> + Send + Sync> DataPages
-    for I
-{
-}
+impl<I: FallibleStreamingIterator<Item = Page, Error = ParquetError> + Send + Sync> Pages for I {}
 
 /// Type def for a sharable, boxed dyn [`Iterator`] of arrays
 pub type ArrayIter<'a> = Box<dyn Iterator<Item = Result<Box<dyn Array>>> + Send + Sync + 'a>;

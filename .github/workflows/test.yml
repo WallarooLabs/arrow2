@@ -13,16 +13,17 @@ jobs:
           submodules: true # needed to test IPC, which are located in a submodule
       - name: Install Rust
         run: rustup update stable
-      - uses: Swatinem/rust-cache@v1
       - name: Setup parquet files
         run: |
           apt update && apt install python3-pip python3-venv -y -q
           python3 -m venv venv
           source venv/bin/activate
           pip install pip --upgrade
-          pip install pyarrow==6
+          pip install pyarrow==6 pyorc
           python parquet_integration/write_parquet.py
+          python tests/it/io/orc/write.py
           deactivate
+      - uses: Swatinem/rust-cache@v1
       - name: Run
         run: cargo test --features full
 
@@ -41,7 +42,9 @@ jobs:
       - uses: Swatinem/rust-cache@v1
       - name: Run
         shell: bash
-        run: ARROW2_IGNORE_PARQUET= cargo test --features full
+        run: |
+          cargo check --features full
+          cargo test --tests
 
   clippy:
     name: Clippy
@@ -111,6 +114,25 @@ jobs:
       - name: Run
         run: MIRIFLAGS="-Zmiri-disable-isolation" cargo miri test --tests --features io_ipc,io_json_integration io::ipc::write::write_sliced_list
 
+  miri-checks-mmap:
+    name: MIRI on IO IPC mmaping
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2022-07-12
+          override: true
+      - uses: Swatinem/rust-cache@v1
+        with:
+          key: key1
+      - name: Install Miri
+        run: |
+          rustup component add miri
+          cargo miri setup
+      - name: Run
+        run: cargo miri test --tests --features io_ipc io::ipc::mmap
+
   feature-compilation:
     name: Feature coverage
     runs-on: ubuntu-latest
@@ -161,7 +183,7 @@ jobs:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: nightly-2022-03-16
+          toolchain: nightly-2022-07-24
           override: true
       - uses: Swatinem/rust-cache@v1
       - name: Run

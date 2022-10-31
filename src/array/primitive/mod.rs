@@ -7,7 +7,7 @@ use crate::{
     datatypes::*,
     error::Error,
     trusted_len::TrustedLen,
-    types::{days_ms, f16, months_days_ns, NativeType},
+    types::{days_ms, f16, i256, months_days_ns, NativeType},
 };
 
 use super::Array;
@@ -69,7 +69,7 @@ fn check<T: NativeType>(
 
     if data_type.to_physical_type() != PhysicalType::Primitive(T::PRIMITIVE) {
         return Err(Error::oos(
-            "BooleanArray can only be initialized with a DataType whose physical type is Primitive",
+            "PrimitiveArray can only be initialized with a DataType whose physical type is Primitive",
         ));
     }
     Ok(())
@@ -286,7 +286,7 @@ impl<T: NativeType> PrimitiveArray<T> {
     /// This is an API to leverage clone-on-write
     /// # Panics
     /// This function panics if the function `f` modifies the length of the [`Bitmap`].
-    pub fn apply_validity<F: Fn(Bitmap) -> Bitmap>(&mut self, f: F) {
+    pub fn apply_validity<F: FnOnce(Bitmap) -> Bitmap>(&mut self, f: F) {
         if let Some(validity) = std::mem::take(&mut self.validity) {
             self.set_validity(Some(f(validity)))
         }
@@ -475,6 +475,8 @@ pub type Int32Array = PrimitiveArray<i32>;
 pub type Int64Array = PrimitiveArray<i64>;
 /// A type definition [`PrimitiveArray`] for `i128`
 pub type Int128Array = PrimitiveArray<i128>;
+/// A type definition [`PrimitiveArray`] for `i256`
+pub type Int256Array = PrimitiveArray<i256>;
 /// A type definition [`PrimitiveArray`] for [`days_ms`]
 pub type DaysMsArray = PrimitiveArray<days_ms>;
 /// A type definition [`PrimitiveArray`] for [`months_days_ns`]
@@ -504,6 +506,8 @@ pub type Int32Vec = MutablePrimitiveArray<i32>;
 pub type Int64Vec = MutablePrimitiveArray<i64>;
 /// A type definition [`MutablePrimitiveArray`] for `i128`
 pub type Int128Vec = MutablePrimitiveArray<i128>;
+/// A type definition [`MutablePrimitiveArray`] for `i256`
+pub type Int256Vec = MutablePrimitiveArray<i256>;
 /// A type definition [`MutablePrimitiveArray`] for [`days_ms`]
 pub type DaysMsVec = MutablePrimitiveArray<days_ms>;
 /// A type definition [`MutablePrimitiveArray`] for [`months_days_ns`]

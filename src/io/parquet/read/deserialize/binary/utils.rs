@@ -13,6 +13,17 @@ pub struct Binary<O: Offset> {
 #[derive(Debug)]
 pub struct Offsets<O: Offset>(pub Vec<O>);
 
+impl<O: Offset> Offsets<O> {
+    #[inline]
+    pub fn extend_lengths<I: Iterator<Item = usize>>(&mut self, lengths: I) {
+        let mut last_offset = *self.0.last().unwrap();
+        self.0.extend(lengths.map(|length| {
+            last_offset += O::from_usize(length).unwrap();
+            last_offset
+        }));
+    }
+}
+
 impl<O: Offset> Pushable<O> for Offsets<O> {
     #[inline]
     fn len(&self) -> usize {
@@ -42,7 +53,7 @@ impl<O: Offset> Binary<O> {
         offsets.push(O::default());
         Self {
             offsets: Offsets(offsets),
-            values: vec![],
+            values: Vec::with_capacity(capacity * 24),
             last_offset: O::default(),
         }
     }
@@ -62,6 +73,17 @@ impl<O: Offset> Binary<O> {
     #[inline]
     pub fn len(&self) -> usize {
         self.offsets.len()
+    }
+
+    #[inline]
+    pub fn extend_lengths<I: Iterator<Item = usize>>(&mut self, lengths: I, values: &mut &[u8]) {
+        let current_offset = self.last_offset;
+        self.offsets.extend_lengths(lengths);
+        self.last_offset = *self.offsets.0.last().unwrap(); // guaranteed to have one
+        let length = self.last_offset.to_usize() - current_offset.to_usize();
+        let (consumed, remaining) = values.split_at(length);
+        *values = remaining;
+        self.values.extend_from_slice(consumed);
     }
 }
 
@@ -107,10 +129,10 @@ impl<'a> Iterator for BinaryIter<'a> {
         if self.values.is_empty() {
             return None;
         }
-        let length = u32::from_le_bytes(self.values[0..4].try_into().unwrap()) as usize;
-        self.values = &self.values[4..];
-        let result = &self.values[..length];
-        self.values = &self.values[length..];
+        let (length, remaining) = self.values.split_at(4);
+        let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+        let (result, remaining) = remaining.split_at(length);
+        self.values = remaining;
         Some(result)
     }
 }

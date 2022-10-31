@@ -238,6 +238,10 @@ impl<O: Offset> MutableArray for MutableBinaryArray<O> {
         self.push::<&[u8]>(None)
     }
 
+    fn reserve(&mut self, additional: usize) {
+        self.reserve(additional)
+    }
+
     fn shrink_to_fit(&mut self) {
         self.shrink_to_fit()
     }
@@ -347,6 +351,21 @@ impl<O: Offset> MutableBinaryArray<O> {
     {
         // Safety: The iterator is `TrustedLen`
         unsafe { self.extend_trusted_len_values_unchecked(iterator) }
+    }
+
+    /// Extends the [`MutableBinaryArray`] from an iterator of values.
+    /// This differs from `extended_trusted_len` which accepts iterator of optional values.
+    #[inline]
+    pub fn extend_values<I, P>(&mut self, iterator: I)
+    where
+        P: AsRef<[u8]>,
+        I: Iterator<Item = P>,
+    {
+        let additional = extend_from_values_iter(&mut self.offsets, &mut self.values, iterator);
+
+        if let Some(validity) = self.validity.as_mut() {
+            validity.extend_constant(additional, true);
+        }
     }
 
     /// Extends the [`MutableBinaryArray`] from an `iterator` of values of trusted length.
