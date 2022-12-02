@@ -82,6 +82,9 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         (Null, _) | (_, Null) => true,
         (Struct(_), _) => false,
         (_, Struct(_)) => false,
+        (FixedSizeList(list_from, from_size), FixedSizeList(list_to, to_size)) => {
+            can_cast_types(&list_from.data_type, &list_to.data_type) && from_size == to_size
+        }
         (FixedSizeList(list_from, _), List(list_to)) => {
             can_cast_types(&list_from.data_type, &list_to.data_type)
         }
@@ -354,6 +357,30 @@ fn cast_large_to_list(array: &ListArray<i64>, to_type: &DataType) -> ListArray<i
     )
 }
 
+fn cast_fixed_size_list(
+    fixed: &FixedSizeListArray,
+    to_type: &DataType,
+    to_size: usize,
+    to_inner: &Field,
+    options: CastOptions,
+) -> Result<FixedSizeListArray> {
+    if to_size != fixed.size() {
+        return Err(Error::Conversion(format!(
+            "fixed size list slot sizes do not match ({} != {})",
+            to_size,
+            fixed.size()
+        )));
+    }
+
+    let new_values = cast(fixed.values().as_ref(), &to_inner.data_type, options)?;
+
+    Ok(FixedSizeListArray::new(
+        to_type.clone(),
+        new_values,
+        fixed.validity().cloned(),
+    ))
+}
+
 fn cast_fixed_size_list_to_list(
     fixed: &FixedSizeListArray,
     to_type: &DataType,
@@ -446,6 +473,14 @@ pub fn cast(array: &dyn Array, to_type: &DataType, options: CastOptions) -> Resu
         (_, Struct(_)) => Err(Error::NotYetImplemented(
             "Cannot cast to struct from other types".to_string(),
         )),
+        (FixedSizeList(_, _), FixedSizeList(inner, size)) => cast_fixed_size_list(
+            array.as_any().downcast_ref().unwrap(),
+            to_type,
+            *size,
+            inner,
+            options,
+        )
+        .map(FixedSizeListArray::boxed),
         (List(_), FixedSizeList(inner, size)) => cast_list_to_fixed_size_list(
             array.as_any().downcast_ref().unwrap(),
             inner.as_ref(),

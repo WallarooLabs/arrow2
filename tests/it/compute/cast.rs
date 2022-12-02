@@ -701,7 +701,7 @@ fn list_to_list() {
 }
 
 #[test]
-fn list_to_from_fixed_size_list() {
+fn fixed_size_list_conversions() {
     let data = vec![
         Some(vec![Some(1i32), Some(2), Some(3)]),
         Some(vec![Some(4), Some(5), None]),
@@ -726,6 +726,13 @@ fn list_to_from_fixed_size_list() {
 
     let result = cast(&fixed, list.data_type(), CastOptions::default()).unwrap();
     assert_eq!(list, result.as_ref());
+
+    let inner = MutablePrimitiveArray::<i32>::new();
+    let mut fixed_target = MutableFixedSizeListArray::<MutablePrimitiveArray<i32>>::new(inner, 3);
+    fixed_target.try_extend(data).unwrap();
+    let fixed_target: FixedSizeListArray = fixed_target.into();
+    let result = cast(&fixed, fixed_target.data_type(), CastOptions::default()).unwrap();
+    assert_eq!(fixed_target, result.as_ref());
 }
 
 #[test]
