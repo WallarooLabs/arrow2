@@ -7,6 +7,8 @@ use std::fmt::{Debug, Display, Formatter};
 pub enum Error {
     /// Returned when functionality is not yet available.
     NotYetImplemented(String),
+    /// One type cannot be converted into another.
+    Conversion(String),
     /// Wrapper for an error triggered by a dependency
     External(String, Box<dyn std::error::Error + Send + Sync>),
     /// Wrapper for IO errors
@@ -73,6 +75,9 @@ impl Display for Error {
         match self {
             Error::NotYetImplemented(source) => {
                 write!(f, "Not yet implemented: {}", &source)
+            }
+            Error::Conversion(source) => {
+                write!(f, "Cannot perform conversion: {}", &source)
             }
             Error::External(message, source) => {
                 write!(f, "External error{}: {}", message, &source)
