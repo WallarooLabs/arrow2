@@ -297,6 +297,39 @@ fn init_nested(init: &[InitNested], capacity: usize) -> NestedState {
     NestedState::new(container)
 }
 
+fn zero_nested(init: &[InitNested], length: usize) -> NestedState {
+    let container = init
+        .iter()
+        .map(|init| match init {
+            InitNested::Primitive(is_nullable) => Box::new(NestedPrimitive {
+                is_nullable: *is_nullable,
+                length: 0,
+            }),
+            InitNested::List(is_nullable) => {
+                let offsets = std::iter::repeat(0).take(length).collect();
+                if *is_nullable {
+                    Box::new(NestedOptional {
+                        validity: MutableBitmap::from_len_set(length),
+                        offsets,
+                    }) as Box<dyn Nested>
+                } else {
+                    Box::new(NestedValid { offsets })
+                }
+            }
+            InitNested::Struct(is_nullable) => {
+                if *is_nullable {
+                    Box::new(NestedStruct {
+                        validity: MutableBitmap::from_len_set(length),
+                    }) as Box<dyn Nested>
+                } else {
+                    Box::new(NestedStructValid { length }) as Box<dyn Nested>
+                }
+            }
+        })
+        .collect();
+    NestedState::new(container)
+}
+
 pub struct NestedPage<'a> {
     iter: std::iter::Peekable<std::iter::Zip<HybridRleDecoder<'a>, HybridRleDecoder<'a>>>,
 }
@@ -510,7 +543,14 @@ where
             if let Some(decoded) = items.pop_front() {
                 MaybeNext::Some(Ok(decoded))
             } else {
-                MaybeNext::None
+                if *remaining > 0 {
+                    let state = zero_nested(init, *remaining);
+                    *remaining = 0;
+                    let data = decoder.with_capacity(0);
+                    MaybeNext::Some(Ok((state, data)))
+                } else {
+                    MaybeNext::None
+                }
             }
         }
         Ok(Some(page)) => {
