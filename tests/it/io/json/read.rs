@@ -195,3 +195,32 @@ fn read_json_fixed_size_records() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn read_json_records_with_schema() -> Result<()> {
+    let raw = b"[{\"matrix\":[0.0,2.0]},{\"matrix\":[0.0,0.0,2.1,3.0]}]";
+    let schema = Schema {
+        fields: vec![Field::new(
+            "matrix",
+            DataType::List(Box::new(Field::new("inner", DataType::Float32, false))),
+            false,
+        )],
+        metadata: Metadata::default(),
+    };
+
+    let json = json_deserializer::parse(raw)?;
+    let actual = read::deserialize_records(&json, &schema)?;
+    assert_eq!(
+        format!("{:?}", actual.arrays()[0]),
+        "ListArray[[0, 2], [0, 0, 2.1, 3]]"
+    );
+
+    let schema = read::infer_records_schema(&json)?;
+    let actual = read::deserialize_records(&json, &schema)?;
+    assert_eq!(
+        format!("{:?}", actual.arrays()[0]),
+        "ListArray[[0, 2], [0, 0, 2.1, 3]]"
+    );
+
+    Ok(())
+}
