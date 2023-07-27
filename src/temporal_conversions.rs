@@ -32,14 +32,25 @@ pub const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 /// converts a `i32` representing a `date32` to [`NaiveDateTime`]
 #[inline]
 pub fn date32_to_datetime(v: i32) -> NaiveDateTime {
+    date32_to_datetime_opt(v).expect("invalid or out-of-range datetime")
+}
+
+/// converts a `i32` representing a `date32` to [`NaiveDateTime`]
+#[inline]
+pub fn date32_to_datetime_opt(v: i32) -> Option<NaiveDateTime> {
     NaiveDateTime::from_timestamp_opt(v as i64 * SECONDS_IN_DAY, 0)
-        .expect("invalid or out-of-range datetime")
 }
 
 /// converts a `i32` representing a `date32` to [`NaiveDate`]
 #[inline]
 pub fn date32_to_date(days: i32) -> NaiveDate {
-    NaiveDate::from_num_days_from_ce_opt(EPOCH_DAYS_FROM_CE + days).expect("out-of-range date")
+    date32_to_date_opt(days).expect("out-of-range date")
+}
+
+/// converts a `i32` representing a `date32` to [`NaiveDate`]
+#[inline]
+pub fn date32_to_date_opt(days: i32) -> Option<NaiveDate> {
+    NaiveDate::from_num_days_from_ce_opt(EPOCH_DAYS_FROM_CE + days)
 }
 
 /// converts a `i64` representing a `date64` to [`NaiveDateTime`]
@@ -81,6 +92,12 @@ pub fn time32ms_to_time(v: i32) -> NaiveTime {
 /// converts a `i64` representing a `time64(us)` to [`NaiveTime`]
 #[inline]
 pub fn time64us_to_time(v: i64) -> NaiveTime {
+    time64us_to_time_opt(v).expect("invalid time")
+}
+
+/// converts a `i64` representing a `time64(us)` to [`NaiveTime`]
+#[inline]
+pub fn time64us_to_time_opt(v: i64) -> Option<NaiveTime> {
     NaiveTime::from_num_seconds_from_midnight_opt(
         // extract seconds from microseconds
         (v / MICROSECONDS) as u32,
@@ -88,61 +105,131 @@ pub fn time64us_to_time(v: i64) -> NaiveTime {
         // nanoseconds
         (v % MICROSECONDS * MILLISECONDS) as u32,
     )
-    .expect("invalid time")
 }
 
 /// converts a `i64` representing a `time64(ns)` to [`NaiveTime`]
 #[inline]
 pub fn time64ns_to_time(v: i64) -> NaiveTime {
+    time64ns_to_time_opt(v).expect("invalid time")
+}
+
+/// converts a `i64` representing a `time64(ns)` to [`NaiveTime`]
+#[inline]
+pub fn time64ns_to_time_opt(v: i64) -> Option<NaiveTime> {
     NaiveTime::from_num_seconds_from_midnight_opt(
         // extract seconds from nanoseconds
         (v / NANOSECONDS) as u32,
         // discard extracted seconds
         (v % NANOSECONDS) as u32,
     )
-    .expect("invalid time")
 }
 
 /// converts a `i64` representing a `timestamp(s)` to [`NaiveDateTime`]
 #[inline]
 pub fn timestamp_s_to_datetime(seconds: i64) -> NaiveDateTime {
-    NaiveDateTime::from_timestamp_opt(seconds, 0).expect("invalid or out-of-range datetime")
+    timestamp_s_to_datetime_opt(seconds).expect("invalid or out-of-range datetime")
+}
+
+/// converts a `i64` representing a `timestamp(s)` to [`NaiveDateTime`]
+#[inline]
+pub fn timestamp_s_to_datetime_opt(seconds: i64) -> Option<NaiveDateTime> {
+    NaiveDateTime::from_timestamp_opt(seconds, 0)
 }
 
 /// converts a `i64` representing a `timestamp(ms)` to [`NaiveDateTime`]
 #[inline]
 pub fn timestamp_ms_to_datetime(v: i64) -> NaiveDateTime {
-    NaiveDateTime::from_timestamp_opt(
-        // extract seconds from milliseconds
-        v / MILLISECONDS,
-        // discard extracted seconds and convert milliseconds to nanoseconds
-        (v % MILLISECONDS * MICROSECONDS) as u32,
-    )
-    .expect("invalid or out-of-range datetime")
+    timestamp_ms_to_datetime_opt(v).expect("invalid or out-of-range datetime")
+}
+
+/// converts a `i64` representing a `timestamp(ms)` to [`NaiveDateTime`]
+#[inline]
+pub fn timestamp_ms_to_datetime_opt(v: i64) -> Option<NaiveDateTime> {
+    if v >= 0 {
+        NaiveDateTime::from_timestamp_opt(
+            // extract seconds from milliseconds
+            v / MILLISECONDS,
+            // discard extracted seconds and convert milliseconds to nanoseconds
+            (v % MILLISECONDS * MICROSECONDS) as u32,
+        )
+    } else {
+        let secs_rem = (v / MILLISECONDS, v % MILLISECONDS);
+        if secs_rem.1 == 0 {
+            // whole/integer seconds; no adjustment required
+            NaiveDateTime::from_timestamp_opt(secs_rem.0, 0)
+        } else {
+            // negative values with fractional seconds require 'div_floor' rounding behaviour.
+            // (which isn't yet stabilised: https://github.com/rust-lang/rust/issues/88581)
+            NaiveDateTime::from_timestamp_opt(
+                secs_rem.0 - 1,
+                (NANOSECONDS + (v % MILLISECONDS * MICROSECONDS)) as u32,
+            )
+        }
+    }
 }
 
 /// converts a `i64` representing a `timestamp(us)` to [`NaiveDateTime`]
 #[inline]
 pub fn timestamp_us_to_datetime(v: i64) -> NaiveDateTime {
-    NaiveDateTime::from_timestamp_opt(
-        // extract seconds from microseconds
-        v / MICROSECONDS,
-        // discard extracted seconds and convert microseconds to nanoseconds
-        (v % MICROSECONDS * MILLISECONDS) as u32,
-    )
-    .expect("invalid or out-of-range datetime")
+    timestamp_us_to_datetime_opt(v).expect("invalid or out-of-range datetime")
+}
+
+/// converts a `i64` representing a `timestamp(us)` to [`NaiveDateTime`]
+#[inline]
+pub fn timestamp_us_to_datetime_opt(v: i64) -> Option<NaiveDateTime> {
+    if v >= 0 {
+        NaiveDateTime::from_timestamp_opt(
+            // extract seconds from microseconds
+            v / MICROSECONDS,
+            // discard extracted seconds and convert microseconds to nanoseconds
+            (v % MICROSECONDS * MILLISECONDS) as u32,
+        )
+    } else {
+        let secs_rem = (v / MICROSECONDS, v % MICROSECONDS);
+        if secs_rem.1 == 0 {
+            // whole/integer seconds; no adjustment required
+            NaiveDateTime::from_timestamp_opt(secs_rem.0, 0)
+        } else {
+            // negative values with fractional seconds require 'div_floor' rounding behaviour.
+            // (which isn't yet stabilised: https://github.com/rust-lang/rust/issues/88581)
+            NaiveDateTime::from_timestamp_opt(
+                secs_rem.0 - 1,
+                (NANOSECONDS + (v % MICROSECONDS * MILLISECONDS)) as u32,
+            )
+        }
+    }
 }
 
 /// converts a `i64` representing a `timestamp(ns)` to [`NaiveDateTime`]
 #[inline]
 pub fn timestamp_ns_to_datetime(v: i64) -> NaiveDateTime {
-    NaiveDateTime::from_timestamp_opt(
-        // extract seconds from nanoseconds
-        v / NANOSECONDS,
-        // discard extracted seconds
-        (v % NANOSECONDS) as u32,
-    )
-    .expect("invalid or out-of-range datetime")
+    timestamp_ns_to_datetime_opt(v).expect("invalid or out-of-range datetime")
+}
+
+/// converts a `i64` representing a `timestamp(ns)` to [`NaiveDateTime`]
+#[inline]
+pub fn timestamp_ns_to_datetime_opt(v: i64) -> Option<NaiveDateTime> {
+    if v >= 0 {
+        NaiveDateTime::from_timestamp_opt(
+            // extract seconds from nanoseconds
+            v / NANOSECONDS,
+            // discard extracted seconds
+            (v % NANOSECONDS) as u32,
+        )
+    } else {
+        let secs_rem = (v / NANOSECONDS, v % NANOSECONDS);
+        if secs_rem.1 == 0 {
+            // whole/integer seconds; no adjustment required
+            NaiveDateTime::from_timestamp_opt(secs_rem.0, 0)
+        } else {
+            // negative values with fractional seconds require 'div_floor' rounding behaviour.
+            // (which isn't yet stabilised: https://github.com/rust-lang/rust/issues/88581)
+            NaiveDateTime::from_timestamp_opt(
+                secs_rem.0 - 1,
+                (NANOSECONDS + (v % NANOSECONDS)) as u32,
+            )
+        }
+    }
 }
 
 /// Converts a timestamp in `time_unit` and `timezone` into [`chrono::DateTime`].
