@@ -677,7 +677,5 @@ pub fn deserialize_records(json: &Value, schema: &Schema) -> Result<Chunk<Box<dy
         }
     }
 
-    Ok(Chunk::new(
-        results.into_values().map(|mut ma| ma.as_box()).collect(),
-    ))
+    Chunk::try_new(results.into_values().map(|mut ma| ma.as_box()).collect())
 }
