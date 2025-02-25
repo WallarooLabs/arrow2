@@ -39,5 +39,5 @@ pub fn deserialize_iter<'a>(
         .collect::<Result<Vec<_>, Error>>()?;
 
     // deserialize &[Value] to Array
-    Ok(_deserialize(&rows, data_type))
+    _deserialize(&rows, data_type)
 }

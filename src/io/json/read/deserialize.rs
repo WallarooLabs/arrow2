@@ -60,12 +60,13 @@ fn build_extract(data_type: &DataType) -> Extract {
 fn deserialize_boolean_into<'a, A: Borrow<Value<'a>>>(
     target: &mut MutableBooleanArray,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
         Value::Bool(v) => Some(v),
         _ => None,
     });
     target.extend_trusted_len(iter);
+    Ok(())
 }
 
 fn deserialize_int_single<T>(number: Number) -> T
@@ -165,13 +166,14 @@ fn deserialize_int_into<
 >(
     target: &mut MutablePrimitiveArray<T>,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
         Value::Number(number) => Some(deserialize_int_single(*number)),
         Value::Bool(number) => Some(if *number { T::one() } else { T::default() }),
         _ => None,
     });
     target.extend_trusted_len(iter);
+    Ok(())
 }
 
 fn deserialize_float_into<
@@ -181,27 +183,32 @@ fn deserialize_float_into<
 >(
     target: &mut MutablePrimitiveArray<T>,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
         Value::Number(number) => Some(deserialize_float_single(number)),
         Value::Bool(number) => Some(if *number { T::one() } else { T::default() }),
         _ => None,
     });
     target.extend_trusted_len(iter);
+    Ok(())
 }
 
-fn deserialize_binary<'a, O: Offset, A: Borrow<Value<'a>>>(rows: &[A]) -> BinaryArray<O> {
+fn deserialize_binary<'a, O: Offset, A: Borrow<Value<'a>>>(
+    rows: &[A],
+) -> Result<BinaryArray<O>, Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
-        Value::String(v) => Some(v.as_bytes()),
-        _ => None,
+        Value::String(v) => Ok(Some(v.as_bytes())),
+        _ => Ok(None),
     });
-    BinaryArray::from_trusted_len_iter(iter)
+    BinaryArray::try_from_trusted_len_iter(iter).map_err(|e: Box<dyn std::error::Error>| {
+        Error::ExternalFormat(format!("Failed to create binary array: {}", e))
+    })
 }
 
 fn deserialize_utf8_into<'a, O: Offset, A: Borrow<Value<'a>>>(
     target: &mut MutableUtf8Array<O>,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     let mut scratch = vec![];
     for row in rows {
         match row.borrow() {
@@ -218,12 +225,13 @@ fn deserialize_utf8_into<'a, O: Offset, A: Borrow<Value<'a>>>(
             _ => target.push_null(),
         }
     }
+    Ok(())
 }
 
 fn deserialize_list<'a, O: Offset, A: Borrow<Value<'a>>>(
     rows: &[A],
     data_type: DataType,
-) -> ListArray<O> {
+) -> Result<ListArray<O>, Error> {
     let child = ListArray::<O>::get_child_type(&data_type);
 
     let mut validity = MutableBitmap::with_capacity(rows.len());
@@ -243,9 +251,14 @@ fn deserialize_list<'a, O: Offset, A: Borrow<Value<'a>>>(
         }
     });
 
-    let values = _deserialize(&inner, child.clone());
+    let values = _deserialize(&inner, child.clone())?;
 
-    ListArray::<O>::new(data_type, offsets.into(), values, validity.into())
+    Ok(ListArray::<O>::new(
+        data_type,
+        offsets.into(),
+        values,
+        validity.into(),
+    ))
 }
 
 // TODO: due to nesting, deduplicating this from the above is trickier than
@@ -253,7 +266,7 @@ fn deserialize_list<'a, O: Offset, A: Borrow<Value<'a>>>(
 fn deserialize_list_into<'a, O: Offset, A: Borrow<Value<'a>>>(
     target: &mut MutableListArray<O, Box<dyn MutableArray>>,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     let empty = vec![];
     let inner: Vec<_> = rows
         .iter()
@@ -263,7 +276,7 @@ fn deserialize_list_into<'a, O: Offset, A: Borrow<Value<'a>>>(
         })
         .collect();
 
-    deserialize_into(target.mut_values(), &inner);
+    deserialize_into(target.mut_values(), &inner)?;
 
     let lengths = rows.iter().map(|row| match row.borrow() {
         Value::Array(value) => Some(value.len()),
@@ -272,18 +285,19 @@ fn deserialize_list_into<'a, O: Offset, A: Borrow<Value<'a>>>(
 
     target
         .try_extend_from_lengths(lengths)
-        .expect("Offsets overflow");
+        .map_err(|e| Error::ExternalFormat(format!("Failed to extend list array: {}", e)))?;
+    Ok(())
 }
 
 fn deserialize_fixed_size_list_into<'a, A: Borrow<Value<'a>>>(
     target: &mut MutableFixedSizeListArray<Box<dyn MutableArray>>,
     rows: &[A],
-) {
+) -> Result<(), Error> {
     for row in rows {
         match row.borrow() {
             Value::Array(value) => {
                 if value.len() == target.size() {
-                    deserialize_into(target.mut_values(), value);
+                    deserialize_into(target.mut_values(), value)?;
                     // unless alignment is already off, the if above should
                     // prevent this from ever happening.
                     target.try_push_valid().expect("unaligned backing array");
@@ -294,27 +308,31 @@ fn deserialize_fixed_size_list_into<'a, A: Borrow<Value<'a>>>(
             _ => target.push_null(),
         }
     }
+    Ok(())
 }
 
 fn deserialize_primitive_into<'a, A: Borrow<Value<'a>>, T: NativeType>(
     target: &mut Box<dyn MutableArray>,
     rows: &[A],
-    deserialize_into: fn(&mut MutablePrimitiveArray<T>, &[A]) -> (),
-) {
+    deserialize_into: fn(&mut MutablePrimitiveArray<T>, &[A]) -> Result<(), Error>,
+) -> Result<(), Error> {
     generic_deserialize_into(target, rows, deserialize_into)
 }
 
 fn generic_deserialize_into<'a, A: Borrow<Value<'a>>, M: 'static>(
     target: &mut Box<dyn MutableArray>,
     rows: &[A],
-    deserialize_into: fn(&mut M, &[A]) -> (),
-) {
-    deserialize_into(target.as_mut_any().downcast_mut::<M>().unwrap(), rows);
+    deserialize_into: fn(&mut M, &[A]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    deserialize_into(target.as_mut_any().downcast_mut::<M>().unwrap(), rows)
 }
 
 /// Deserialize `rows` by extending them into the given `target`
-fn deserialize_into<'a, A: Borrow<Value<'a>>>(target: &mut Box<dyn MutableArray>, rows: &[A]) {
-    match target.data_type() {
+fn deserialize_into<'a, A: Borrow<Value<'a>>>(
+    target: &mut Box<dyn MutableArray>,
+    rows: &[A],
+) -> Result<(), Error> {
+    Ok(match target.data_type() {
         DataType::Boolean => generic_deserialize_into(target, rows, deserialize_boolean_into),
         DataType::Float32 => {
             deserialize_primitive_into::<_, f32>(target, rows, deserialize_float_into)
@@ -359,11 +377,15 @@ fn deserialize_into<'a, A: Borrow<Value<'a>>>(target: &mut Box<dyn MutableArray>
         _ => {
             todo!()
         }
-    }
+    }?)
 }
 
-fn deserialize_struct<'a, A: Borrow<Value<'a>>>(rows: &[A], data_type: DataType) -> StructArray {
-    let fields = StructArray::get_fields(&data_type);
+fn deserialize_struct<'a, A: Borrow<Value<'a>>>(
+    rows: &[A],
+    data_type: DataType,
+) -> Result<StructArray, Error> {
+    let fields = StructArray::try_get_fields(&data_type)
+        .map_err(|e| Error::ExternalFormat(format!("Invalid struct fields: {}", e)))?;
 
     let mut values = fields
         .iter()
@@ -392,15 +414,16 @@ fn deserialize_struct<'a, A: Borrow<Value<'a>>>(rows: &[A], data_type: DataType)
     let values = values
         .into_iter()
         .map(|(_, (data_type, values))| _deserialize(&values, data_type.clone()))
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
-    StructArray::new(data_type, values, validity.into())
+    StructArray::try_new(data_type, values, validity.into())
+        .map_err(|e| Error::ExternalFormat(format!("Failed to create struct array: {}", e)))
 }
 
 fn deserialize_dictionary<'a, K: DictionaryKey, A: Borrow<Value<'a>>>(
     rows: &[A],
     data_type: DataType,
-) -> DictionaryArray<K> {
+) -> Result<DictionaryArray<K>, Error> {
     let child = DictionaryArray::<K>::try_get_child(&data_type).unwrap();
 
     let mut map = HashedMap::<u64, K>::default();
@@ -430,22 +453,23 @@ fn deserialize_dictionary<'a, K: DictionaryKey, A: Borrow<Value<'a>>>(
         .collect::<PrimitiveArray<K>>();
 
     drop(extractor);
-    let values = _deserialize(&inner, child.clone());
-    DictionaryArray::<K>::try_new(data_type, keys, values).unwrap()
+    let values = _deserialize(&inner, child.clone())?;
+    DictionaryArray::<K>::try_new(data_type, keys, values)
+        .map_err(|e| Error::ExternalFormat(format!("Failed to create dictionary array: {}", e)))
 }
 
 fn fill_array_from<B, T, A>(
-    f: fn(&mut MutablePrimitiveArray<T>, &[B]),
+    f: fn(&mut MutablePrimitiveArray<T>, &[B]) -> Result<(), Error>,
     data_type: DataType,
     rows: &[B],
-) -> Box<dyn Array>
+) -> Result<Box<dyn Array>, Error>
 where
     T: NativeType,
     A: From<MutablePrimitiveArray<T>> + Array,
 {
     let mut array = MutablePrimitiveArray::<T>::with_capacity(rows.len()).to(data_type);
-    f(&mut array, rows);
-    Box::new(A::from(array))
+    f(&mut array, rows)?;
+    Ok(Box::new(A::from(array)))
 }
 
 /// A trait describing an array with a backing store that can be preallocated to
@@ -493,36 +517,48 @@ impl<O: Offset> Container for MutableUtf8Array<O> {
     }
 }
 
-fn fill_generic_array_from<B, M, A>(f: fn(&mut M, &[B]), rows: &[B]) -> Box<dyn Array>
+fn fill_generic_array_from<B, M, A>(
+    f: fn(&mut M, &[B]) -> Result<(), Error>,
+    rows: &[B],
+) -> Result<Box<dyn Array>, Error>
 where
     M: Container,
     A: From<M> + Array,
 {
     let mut array = M::with_capacity(rows.len());
-    f(&mut array, rows);
-    Box::new(A::from(array))
+    f(&mut array, rows)?;
+    Ok(Box::new(A::from(array)))
 }
 
 pub(crate) fn _deserialize<'a, A: Borrow<Value<'a>>>(
     rows: &[A],
     data_type: DataType,
-) -> Box<dyn Array> {
+) -> Result<Box<dyn Array>, Error> {
     match &data_type {
-        DataType::Null => Box::new(NullArray::new(data_type, rows.len())),
-        DataType::Boolean => {
-            fill_generic_array_from::<_, _, BooleanArray>(deserialize_boolean_into, rows)
-        }
-        DataType::Int8 => {
-            fill_array_from::<_, _, PrimitiveArray<i8>>(deserialize_int_into, data_type, rows)
-        }
-        DataType::Int16 => {
-            fill_array_from::<_, _, PrimitiveArray<i16>>(deserialize_int_into, data_type, rows)
-        }
+        DataType::Null => Ok(Box::new(NullArray::try_new(data_type, rows.len())?)),
+        DataType::Boolean => Ok(fill_generic_array_from::<_, _, BooleanArray>(
+            deserialize_boolean_into,
+            rows,
+        )?),
+        DataType::Int8 => Ok(fill_array_from::<_, _, PrimitiveArray<i8>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
+        DataType::Int16 => Ok(fill_array_from::<_, _, PrimitiveArray<i16>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
         DataType::Int32
         | DataType::Date32
         | DataType::Time32(_)
         | DataType::Interval(IntervalUnit::YearMonth) => {
-            fill_array_from::<_, _, PrimitiveArray<i32>>(deserialize_int_into, data_type, rows)
+            Ok(fill_array_from::<_, _, PrimitiveArray<i32>>(
+                deserialize_int_into,
+                data_type,
+                rows,
+            )?)
         }
         DataType::Interval(IntervalUnit::DayTime) => {
             unimplemented!("There is no natural representation of DayTime in JSON.")
@@ -531,50 +567,66 @@ pub(crate) fn _deserialize<'a, A: Borrow<Value<'a>>>(
         | DataType::Date64
         | DataType::Time64(_)
         | DataType::Timestamp(_, _)
-        | DataType::Duration(_) => {
-            fill_array_from::<_, _, PrimitiveArray<i64>>(deserialize_int_into, data_type, rows)
-        }
-        DataType::UInt8 => {
-            fill_array_from::<_, _, PrimitiveArray<u8>>(deserialize_int_into, data_type, rows)
-        }
-        DataType::UInt16 => {
-            fill_array_from::<_, _, PrimitiveArray<u16>>(deserialize_int_into, data_type, rows)
-        }
-        DataType::UInt32 => {
-            fill_array_from::<_, _, PrimitiveArray<u32>>(deserialize_int_into, data_type, rows)
-        }
-        DataType::UInt64 => {
-            fill_array_from::<_, _, PrimitiveArray<u64>>(deserialize_int_into, data_type, rows)
-        }
+        | DataType::Duration(_) => Ok(fill_array_from::<_, _, PrimitiveArray<i64>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
+        DataType::UInt8 => Ok(fill_array_from::<_, _, PrimitiveArray<u8>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
+        DataType::UInt16 => Ok(fill_array_from::<_, _, PrimitiveArray<u16>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
+        DataType::UInt32 => Ok(fill_array_from::<_, _, PrimitiveArray<u32>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
+        DataType::UInt64 => Ok(fill_array_from::<_, _, PrimitiveArray<u64>>(
+            deserialize_int_into,
+            data_type,
+            rows,
+        )?),
         DataType::Float16 => unreachable!(),
-        DataType::Float32 => {
-            fill_array_from::<_, _, PrimitiveArray<f32>>(deserialize_float_into, data_type, rows)
-        }
-        DataType::Float64 => {
-            fill_array_from::<_, _, PrimitiveArray<f64>>(deserialize_float_into, data_type, rows)
-        }
-        DataType::Utf8 => {
-            fill_generic_array_from::<_, _, Utf8Array<i32>>(deserialize_utf8_into, rows)
-        }
-        DataType::LargeUtf8 => {
-            fill_generic_array_from::<_, _, Utf8Array<i64>>(deserialize_utf8_into, rows)
-        }
-        DataType::List(_) => Box::new(deserialize_list::<i32, _>(rows, data_type)),
-        DataType::LargeList(_) => Box::new(deserialize_list::<i64, _>(rows, data_type)),
-        DataType::Binary => Box::new(deserialize_binary::<i32, _>(rows)),
-        DataType::LargeBinary => Box::new(deserialize_binary::<i64, _>(rows)),
-        DataType::Struct(_) => Box::new(deserialize_struct(rows, data_type)),
+        DataType::Float32 => Ok(fill_array_from::<_, _, PrimitiveArray<f32>>(
+            deserialize_float_into,
+            data_type,
+            rows,
+        )?),
+        DataType::Float64 => Ok(fill_array_from::<_, _, PrimitiveArray<f64>>(
+            deserialize_float_into,
+            data_type,
+            rows,
+        )?),
+        DataType::Utf8 => Ok(fill_generic_array_from::<_, _, Utf8Array<i32>>(
+            deserialize_utf8_into,
+            rows,
+        )?),
+        DataType::LargeUtf8 => Ok(fill_generic_array_from::<_, _, Utf8Array<i64>>(
+            deserialize_utf8_into,
+            rows,
+        )?),
+        DataType::List(_) => Ok(Box::new(deserialize_list::<i32, _>(rows, data_type)?)),
+        DataType::LargeList(_) => Ok(Box::new(deserialize_list::<i64, _>(rows, data_type)?)),
+        DataType::Binary => Ok(Box::new(deserialize_binary::<i32, _>(rows)?)),
+        DataType::LargeBinary => Ok(Box::new(deserialize_binary::<i64, _>(rows)?)),
+        DataType::Struct(_) => Ok(Box::new(deserialize_struct(rows, data_type)?)),
         DataType::Dictionary(key_type, _, _) => {
             match_integer_type!(key_type, |$T| {
-                Box::new(deserialize_dictionary::<$T, _>(rows, data_type))
+                Ok(Box::new(deserialize_dictionary::<$T, _>(rows, data_type)?))
             })
         }
-        _ => todo!(),
         /*
-        DataType::FixedSizeBinary(_) => Box::new(FixedSizeBinaryArray::new_empty(data_type)),
-        DataType::FixedSizeList(_, _) => Box::new(FixedSizeListArray::new_empty(data_type)),
-        DataType::Decimal(_, _) => Box::new(PrimitiveArray::<i128>::new_empty(data_type)),
-        */
+        DataType::FixedSizeBinary(_) => Ok(Box::new(FixedSizeBinaryArray::new_empty(data_type))),
+        DataType::FixedSizeList(_, _) => Ok(Box::new(FixedSizeListArray::new_empty(data_type))),
+        DataType::Decimal(_, _) => Ok(Box::new(PrimitiveArray::<i128>::new_empty(data_type))),
+         */
+        _ => todo!("Unsupported data type: {:?}", data_type),
     }
 }
 
@@ -588,7 +640,7 @@ pub fn deserialize(json: &Value, data_type: DataType) -> Result<Box<dyn Array>, 
     match json {
         Value::Array(rows) => match data_type {
             DataType::List(inner) | DataType::LargeList(inner) => {
-                Ok(_deserialize(rows, inner.data_type))
+                _deserialize(rows, inner.data_type)
             }
             _ => Err(Error::nyi("read an Array from a non-Array data type")),
         },
@@ -659,7 +711,7 @@ pub fn deserialize_records(json: &Value, schema: &Schema) -> Result<Chunk<Box<dy
                             let arr = results.get_mut(key).ok_or_else(|| {
                                 Error::ExternalFormat(format!("unexpected key: '{key}'"))
                             })?;
-                            deserialize_into(arr, &[value]);
+                            deserialize_into(arr, &[value])?;
                         }
                     }
                     _ => {
