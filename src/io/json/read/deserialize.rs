@@ -29,8 +29,24 @@ fn build_extract(data_type: &DataType) -> Extract {
                 Some((hasher.finish(), value))
             }
             Value::Number(v) => match v {
-                Number::Float(_, _) => todo!(),
-                Number::Integer(_, _) => todo!(),
+                Number::Float(fraction, exponent) => {
+                    let mut hasher = DefaultHasher::new();
+                    hasher.write(fraction);
+                    if !exponent.is_empty() {
+                        hasher.write(b"e");
+                        hasher.write(exponent);
+                    }
+                    Some((hasher.finish(), value))
+                }
+                Number::Integer(integer, exponent) => {
+                    let mut hasher = DefaultHasher::new();
+                    hasher.write(integer);
+                    if !exponent.is_empty() {
+                        hasher.write(b"e");
+                        hasher.write(exponent);
+                    }
+                    Some((hasher.finish(), value))
+                }
             },
             Value::Bool(v) => {
                 let mut hasher = DefaultHasher::new();
@@ -77,12 +93,15 @@ where
 {
     match number {
         Number::Float(fraction, exponent) => {
-            let integer = fraction.split(|x| *x == b'.').next().unwrap();
+            let integer = fraction.split(|x| *x == b'.').next().ok_or_else(|| {
+                Error::ExternalFormat("Failed to parse float: no bytes".to_string())
+            })?;
             let mut integer: T = lexical_core::parse(integer)
                 .map_err(|e| Error::ExternalFormat(format!("Failed to parse integer: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: u32 = lexical_core::parse(exponent)
-                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
+                let exponent: u32 = lexical_core::parse(exponent).map_err(|e| {
+                    Error::ExternalFormat(format!("Failed to parse exponent: {}", e))
+                })?;
                 integer = integer.pow10(exponent);
             }
             Ok(integer)
@@ -91,8 +110,9 @@ where
             let mut integer: T = lexical_core::parse(integer)
                 .map_err(|e| Error::ExternalFormat(format!("Failed to parse integer: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: u32 = lexical_core::parse(exponent)
-                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
+                let exponent: u32 = lexical_core::parse(exponent).map_err(|e| {
+                    Error::ExternalFormat(format!("Failed to parse exponent: {}", e))
+                })?;
                 integer = integer.pow10(exponent);
             }
             Ok(integer)
@@ -150,8 +170,9 @@ where
             let mut float: T = lexical_core::parse(float)
                 .map_err(|e| Error::ExternalFormat(format!("Failed to parse float: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: i32 = lexical_core::parse(exponent)
-                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
+                let exponent: i32 = lexical_core::parse(exponent).map_err(|e| {
+                    Error::ExternalFormat(format!("Failed to parse exponent: {}", e))
+                })?;
                 float = float.powi10(exponent);
             }
             Ok(float)
@@ -160,8 +181,9 @@ where
             let mut float: T = lexical_core::parse(integer)
                 .map_err(|e| Error::ExternalFormat(format!("Failed to parse float: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: i32 = lexical_core::parse(exponent)
-                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
+                let exponent: i32 = lexical_core::parse(exponent).map_err(|e| {
+                    Error::ExternalFormat(format!("Failed to parse exponent: {}", e))
+                })?;
                 float = float.powi10(exponent);
             }
             Ok(float)
@@ -247,19 +269,22 @@ fn deserialize_list<'a, O: Offset, A: Borrow<Value<'a>>>(
     let mut validity = MutableBitmap::with_capacity(rows.len());
     let mut offsets = Offsets::<O>::with_capacity(rows.len());
     let mut inner = vec![];
-    rows.iter().for_each(|row| match row.borrow() {
-        Value::Array(value) => {
-            inner.extend(value.iter());
-            validity.push(true);
-            offsets
-                .try_push_usize(value.len())
-                .expect("List offset is too large :/");
+
+    for row in rows.iter() {
+        match row.borrow() {
+            Value::Array(value) => {
+                inner.extend(value.iter());
+                validity.push(true);
+                offsets.try_push_usize(value.len()).map_err(|_| {
+                    Error::ExternalFormat("List offset exceeds maximum supported size".to_string())
+                })?;
+            }
+            _ => {
+                validity.push(false);
+                offsets.extend_constant(1);
+            }
         }
-        _ => {
-            validity.push(false);
-            offsets.extend_constant(1);
-        }
-    });
+    }
 
     let values = _deserialize(&inner, child.clone())?;
 
@@ -310,7 +335,12 @@ fn deserialize_fixed_size_list_into<'a, A: Borrow<Value<'a>>>(
                     deserialize_into(target.mut_values(), value)?;
                     // unless alignment is already off, the if above should
                     // prevent this from ever happening.
-                    target.try_push_valid().expect("unaligned backing array");
+                    target.try_push_valid().map_err(|_| {
+                        Error::ExternalFormat(
+                            "Failed to push to fixed size list array - unaligned backing array"
+                                .to_string(),
+                        )
+                    })?;
                 } else {
                     target.push_null();
                 }
@@ -326,7 +356,13 @@ fn deserialize_primitive_into<'a, A: Borrow<Value<'a>>, T: NativeType>(
     rows: &[A],
     deserialize_into: fn(&mut MutablePrimitiveArray<T>, &[A]) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    generic_deserialize_into(target, rows, deserialize_into)
+    let primitive_array = target
+        .as_mut_any()
+        .downcast_mut::<MutablePrimitiveArray<T>>()
+        .ok_or_else(|| {
+            Error::ExternalFormat("Failed to downcast to primitive array".to_string())
+        })?;
+    deserialize_into(primitive_array, rows)
 }
 
 fn generic_deserialize_into<'a, A: Borrow<Value<'a>>, M: 'static>(
@@ -334,7 +370,11 @@ fn generic_deserialize_into<'a, A: Borrow<Value<'a>>, M: 'static>(
     rows: &[A],
     deserialize_into: fn(&mut M, &[A]) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    deserialize_into(target.as_mut_any().downcast_mut::<M>().unwrap(), rows)
+    let array = target
+        .as_mut_any()
+        .downcast_mut::<M>()
+        .ok_or_else(|| Error::ExternalFormat("Failed to downcast array".to_string()))?;
+    deserialize_into(array, rows)
 }
 
 /// Deserialize `rows` by extending them into the given `target`
@@ -381,12 +421,15 @@ fn deserialize_into<'a, A: Borrow<Value<'a>>>(
             target
                 .as_mut_any()
                 .downcast_mut::<MutableListArray<i32, Box<dyn MutableArray>>>()
-                .unwrap(),
+                .ok_or_else(|| {
+                    Error::ExternalFormat("Failed to downcast to list array".to_string())
+                })?,
             rows,
         ),
-        _ => {
-            todo!()
-        }
+        _ => Err(Error::ExternalFormat(format!(
+            "Unsupported data type in deserialize_into: {:?}",
+            target.data_type()
+        ))),
     }?)
 }
 
@@ -434,7 +477,7 @@ fn deserialize_dictionary<'a, K: DictionaryKey, A: Borrow<Value<'a>>>(
     rows: &[A],
     data_type: DataType,
 ) -> Result<DictionaryArray<K>, Error> {
-    let child = DictionaryArray::<K>::try_get_child(&data_type).unwrap();
+    let child = DictionaryArray::<K>::try_get_child(&data_type)?;
 
     let mut map = HashedMap::<u64, K>::default();
 
@@ -445,16 +488,23 @@ fn deserialize_dictionary<'a, K: DictionaryKey, A: Borrow<Value<'a>>>(
         .iter()
         .map(|x| extractor(x.borrow()))
         .map(|item| match item {
-            Some((hash, v)) => match map.get(&hash) {
-                Some(key) => Some(*key),
-                None => {
-                    let key = map.len().try_into()
-                        .map_err(|_| Error::ExternalFormat("Dictionary key type is too small for the number of unique values".to_string())).ok()?;
-                    inner.push(v);
-                    map.insert(hash, key);
-                    Some(key)
+            Some((hash, v)) => {
+                if let Some(key) = map.get(&hash) {
+                    Some(*key)
+                } else {
+                    match K::try_from(map.len()) {
+                        Ok(key) => {
+                            inner.push(v);
+                            map.insert(hash, key);
+                            Some(key)
+                        }
+                        Err(_) => {
+                            // Dictionary key type overflow
+                            None
+                        }
+                    }
                 }
-            },
+            }
             None => None,
         })
         .collect::<PrimitiveArray<K>>();
@@ -533,7 +583,8 @@ where
     A: From<M> + Array,
 {
     let mut array = M::with_capacity(rows.len());
-    f(&mut array, rows)?;
+    f(&mut array, rows)
+        .map_err(|e| Error::ExternalFormat(format!("Failed to fill array: {}", e)))?;
     Ok(Box::new(A::from(array)))
 }
 
@@ -599,7 +650,10 @@ pub(crate) fn _deserialize<'a, A: Borrow<Value<'a>>>(
             data_type,
             rows,
         )?),
-        DataType::Float16 => unreachable!(),
+        DataType::Float16 => Err(Error::ExternalFormat(
+            "Float16 arrays cannot be directly deserialized from JSON - use Float32 instead"
+                .to_string(),
+        )),
         DataType::Float32 => Ok(fill_array_from::<_, _, PrimitiveArray<f32>>(
             deserialize_float_into,
             data_type,
@@ -671,17 +725,17 @@ fn allocate_array(f: &Field) -> Box<dyn MutableArray> {
         DataType::Boolean => Box::new(MutableBooleanArray::new()),
         DataType::Utf8 => Box::new(MutableUtf8Array::<i32>::new()),
         DataType::LargeUtf8 => Box::new(MutableUtf8Array::<i64>::new()),
-        DataType::FixedSizeList(inner, size) => Box::new(MutableFixedSizeListArray::<_>::new_from(
+        DataType::FixedSizeList(inner, size) => Box::new(MutableFixedSizeListArray::<_>::try_new_from(
             allocate_array(inner),
             f.data_type().clone(),
             *size,
-        )),
-        DataType::List(inner) => Box::new(MutableListArray::<i32, _>::new_from(
+        )?),
+        DataType::List(inner) => Box::new(MutableListArray::<i32, _>::try_new_from(
             allocate_array(inner),
             f.data_type().clone(),
             0,
-        )),
-        _ => todo!(),
+        )?),
+        _ => Box::new(MutablePrimitiveArray::<i8>::new()),
     }
 }
 
@@ -718,7 +772,11 @@ pub fn deserialize_records(json: &Value, schema: &Schema) -> Result<Chunk<Box<dy
                             let arr = results.get_mut(key).ok_or_else(|| {
                                 Error::ExternalFormat(format!("unexpected key: '{key}'"))
                             })?;
-                            deserialize_into(arr, &[value])?;
+                            deserialize_into(arr, &[value]).map_err(|e| {
+                                Error::ExternalFormat(format!(
+                                    "Failed to deserialize value for key '{key}': {e}"
+                                ))
+                            })?;
                         }
                     }
                     _ => {
