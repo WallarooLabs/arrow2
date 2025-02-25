@@ -43,13 +43,15 @@ fn build_extract(data_type: &DataType) -> Extract {
             Box::new(move |value| {
                 let integer = match value {
                     Value::Number(number) => Some(deserialize_int_single::<i64>(*number)),
-                    Value::Bool(number) => Some(i64::from(*number)),
+                    Value::Bool(number) => Some(Ok(i64::from(*number))),
                     _ => None,
                 };
-                integer.map(|integer| {
-                    let mut hasher = DefaultHasher::new();
-                    hasher.write(&integer.to_le_bytes());
-                    (hasher.finish(), value)
+                integer.and_then(|integer_result| {
+                    integer_result.ok().map(|integer| {
+                        let mut hasher = DefaultHasher::new();
+                        hasher.write(&integer.to_le_bytes());
+                        (hasher.finish(), value)
+                    })
                 })
             })
         }
@@ -69,27 +71,31 @@ fn deserialize_boolean_into<'a, A: Borrow<Value<'a>>>(
     Ok(())
 }
 
-fn deserialize_int_single<T>(number: Number) -> T
+fn deserialize_int_single<T>(number: Number) -> Result<T, Error>
 where
     T: NativeType + lexical_core::FromLexical + Pow10,
 {
     match number {
         Number::Float(fraction, exponent) => {
             let integer = fraction.split(|x| *x == b'.').next().unwrap();
-            let mut integer: T = lexical_core::parse(integer).unwrap();
+            let mut integer: T = lexical_core::parse(integer)
+                .map_err(|e| Error::ExternalFormat(format!("Failed to parse integer: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: u32 = lexical_core::parse(exponent).unwrap();
+                let exponent: u32 = lexical_core::parse(exponent)
+                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
                 integer = integer.pow10(exponent);
             }
-            integer
+            Ok(integer)
         }
         Number::Integer(integer, exponent) => {
-            let mut integer: T = lexical_core::parse(integer).unwrap();
+            let mut integer: T = lexical_core::parse(integer)
+                .map_err(|e| Error::ExternalFormat(format!("Failed to parse integer: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: u32 = lexical_core::parse(exponent).unwrap();
+                let exponent: u32 = lexical_core::parse(exponent)
+                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
                 integer = integer.pow10(exponent);
             }
-            integer
+            Ok(integer)
         }
     }
 }
@@ -135,26 +141,30 @@ impl_pow10!(i16);
 impl_pow10!(i32);
 impl_pow10!(i64);
 
-fn deserialize_float_single<T>(number: &Number) -> T
+fn deserialize_float_single<T>(number: &Number) -> Result<T, Error>
 where
     T: NativeType + lexical_core::FromLexical + Powi10,
 {
     match number {
         Number::Float(float, exponent) => {
-            let mut float: T = lexical_core::parse(float).unwrap();
+            let mut float: T = lexical_core::parse(float)
+                .map_err(|e| Error::ExternalFormat(format!("Failed to parse float: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: i32 = lexical_core::parse(exponent).unwrap();
+                let exponent: i32 = lexical_core::parse(exponent)
+                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
                 float = float.powi10(exponent);
             }
-            float
+            Ok(float)
         }
         Number::Integer(integer, exponent) => {
-            let mut float: T = lexical_core::parse(integer).unwrap();
+            let mut float: T = lexical_core::parse(integer)
+                .map_err(|e| Error::ExternalFormat(format!("Failed to parse float: {}", e)))?;
             if !exponent.is_empty() {
-                let exponent: i32 = lexical_core::parse(exponent).unwrap();
+                let exponent: i32 = lexical_core::parse(exponent)
+                    .map_err(|e| Error::ExternalFormat(format!("Failed to parse exponent: {}", e)))?;
                 float = float.powi10(exponent);
             }
-            float
+            Ok(float)
         }
     }
 }
@@ -168,7 +178,7 @@ fn deserialize_int_into<
     rows: &[A],
 ) -> Result<(), Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
-        Value::Number(number) => Some(deserialize_int_single(*number)),
+        Value::Number(number) => deserialize_int_single(*number).ok(),
         Value::Bool(number) => Some(if *number { T::one() } else { T::default() }),
         _ => None,
     });
@@ -185,7 +195,7 @@ fn deserialize_float_into<
     rows: &[A],
 ) -> Result<(), Error> {
     let iter = rows.iter().map(|row| match row.borrow() {
-        Value::Number(number) => Some(deserialize_float_single(number)),
+        Value::Number(number) => deserialize_float_single(number).ok(),
         Value::Bool(number) => Some(if *number { T::one() } else { T::default() }),
         _ => None,
     });
@@ -438,11 +448,8 @@ fn deserialize_dictionary<'a, K: DictionaryKey, A: Borrow<Value<'a>>>(
             Some((hash, v)) => match map.get(&hash) {
                 Some(key) => Some(*key),
                 None => {
-                    let key = match map.len().try_into() {
-                        Ok(key) => key,
-                        // todo: convert this to an error.
-                        Err(_) => panic!("The maximum key is too small for this json struct"),
-                    };
+                    let key = map.len().try_into()
+                        .map_err(|_| Error::ExternalFormat("Dictionary key type is too small for the number of unique values".to_string())).ok()?;
                     inner.push(v);
                     map.insert(hash, key);
                     Some(key)
@@ -626,7 +633,7 @@ pub(crate) fn _deserialize<'a, A: Borrow<Value<'a>>>(
         DataType::FixedSizeList(_, _) => Ok(Box::new(FixedSizeListArray::new_empty(data_type))),
         DataType::Decimal(_, _) => Ok(Box::new(PrimitiveArray::<i128>::new_empty(data_type))),
          */
-        _ => todo!("Unsupported data type: {:?}", data_type),
+        _ => Err(Error::ExternalFormat(format!("Unsupported data type: {:?}", data_type))),
     }
 }
 
