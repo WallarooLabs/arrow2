@@ -8,7 +8,7 @@ jobs:
     name: Test full
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true # needed to test IPC, which are located in a submodule
       - name: Install Rust
@@ -23,7 +23,7 @@ jobs:
           python parquet_integration/write_parquet.py
           python tests/it/io/orc/write.py
           deactivate
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Run
         run: cargo test --features full
 
@@ -34,12 +34,12 @@ jobs:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true # needed to test IPC, which are located in a submodule
       - name: Install Rust
         run: rustup update stable
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Run
         shell: bash
         run: |
@@ -50,10 +50,10 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Install clippy
         run: rustup component add clippy
       - name: "clippy --all"
@@ -63,10 +63,10 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Install rustfmt
         run: rustup component add rustfmt
       - name: Run
@@ -76,12 +76,10 @@ jobs:
     name: Miri
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2022-12-05
-          override: true
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
         with:
           key: key1
       - name: Install Miri
@@ -97,14 +95,12 @@ jobs:
     name: MIRI on IO IPC
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true # needed to test IPC, which are located in a submodule
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2022-12-05
-          override: true
-      - uses: Swatinem/rust-cache@v1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
         with:
           key: key1
       - name: Install Miri
@@ -118,12 +114,10 @@ jobs:
     name: MIRI on IO IPC mmaping
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2022-12-05
-          override: true
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
         with:
           key: key1
       - name: Install Miri
@@ -137,12 +131,12 @@ jobs:
     name: Feature coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Install Rust
         run: rustup update stable
       - name: Setup all features
         run: cargo install cargo-all-features
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Run
         run: cargo check-all-features
       - name: Bench Check
@@ -161,31 +155,27 @@ jobs:
           - mips-unknown-linux-gnu
           - arm-linux-androideabi
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: actions-rs/toolchain@v1
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2022-12-05
-          target: ${{ matrix.target }}
-          override: true
-      - uses: Swatinem/rust-cache@v1
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: check
-          args: --features=compute_merge_sort,io_ipc,io_csv,io_print,io_json,io_parquet --target ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross
+      - name: Run
+        run: cross check --features=compute_merge_sort,io_ipc,io_csv,io_print,io_json,io_parquet --target ${{ matrix.target }}
 
   linux-simd-test:
     name: SIMD
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2022-12-05
-          override: true
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
       - name: Run
         # no need to run over all features: simd only affects the core
         run: cargo test --tests --no-default-features --features compute,simd
