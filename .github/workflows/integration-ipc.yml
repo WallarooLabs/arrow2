@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Arrow
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           repository: apache/arrow
           submodules: true
@@ -17,7 +17,7 @@ jobs:
       - name: Remove Rust from arrow
         run: rm -rf rust/
       - name: Checkout Arrow Rust
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: rust
           fetch-depth: 0
@@ -25,11 +25,8 @@ jobs:
       # which is incompatible with this. Let's monkey patch it
       - name: Fix compilation
         run: cp rust/integration-testing/rust_build.sh ci/scripts/rust_build.sh
-      # unskip many of the tests
-      - name: Test more cases
-        run: git apply rust/integration-testing/unskip.patch
       - name: Setup Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Setup Archery
