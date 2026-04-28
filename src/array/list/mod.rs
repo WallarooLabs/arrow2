@@ -89,7 +89,7 @@ impl<O: Offset> ListArray<O> {
     /// Returns a new empty [`ListArray`].
     pub fn new_empty(data_type: DataType) -> Self {
         let values = new_empty_array(Self::get_child_type(&data_type).clone());
-        Self::new(data_type, OffsetsBuffer::default(), values, None)
+        Self::new(data_type, Offsets::new_zeroed(0).into(), values, None)
     }
 
     /// Returns a new null [`ListArray`].
